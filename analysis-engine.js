@@ -299,89 +299,119 @@ const SwingAnalyzer = (() => {
      * Detect individual swing/pitch events from the motion timeline.
      * Only searches within gameplay frames (after title card).
      *
-     * A swing event is a sharp spike in batter-zone motion.
-     * Returns array of { peakTime, startTime, endTime, peakMotion, sampleIndices }
+     * KEY INSIGHT: The swing is at the ONSET of motion, not the peak.
+     * After contact, the batter runs to first base — that creates much
+     * higher motion than the actual swing, but it happens AFTER the swing.
+     *
+     * Strategy: Find transitions from low→high motion. The swing is at
+     * the onset (first frame above threshold). Build extraction window
+     * around the onset with time biased before it (stance/load) and
+     * a short time after (swing/contact/follow-through), NOT extending
+     * into the running phase.
+     *
+     * Returns array of { onsetTime, startTime, endTime, peakMotion }
      */
     function detectSwingEvents(samples, minGapSeconds, gameplayStartIdx) {
-        // Only look at gameplay frames
         const gameplay = samples.slice(gameplayStartIdx);
         if (gameplay.length < 3) return [];
 
         const motions = gameplay.map(s => s.batterMotion);
 
-        // Compute adaptive threshold: mean + 1.5 * stddev of batter motion
+        // Compute adaptive threshold
         const mean = motions.reduce((a, b) => a + b, 0) / motions.length;
         const variance = motions.reduce((a, b) => a + (b - mean) ** 2, 0) / motions.length;
         const stddev = Math.sqrt(variance);
-        const threshold = Math.max(mean + 1.5 * stddev, mean * 2, 0.012);
+        const threshold = Math.max(mean + 1.0 * stddev, mean * 1.5, 0.01);
 
-        // Find peaks above threshold
-        const peaks = [];
-        for (let i = 1; i < motions.length - 1; i++) {
-            if (motions[i] > threshold && motions[i] >= motions[i - 1] && motions[i] >= motions[i + 1]) {
-                peaks.push({
-                    idx: i + gameplayStartIdx, // map back to original index
-                    motion: motions[i],
-                    time: gameplay[i].time,
-                });
+        // Find motion ONSETS: transitions from below-threshold to above-threshold.
+        // Each onset represents the start of a motion event (swing or other action).
+        const rawEvents = [];
+        let inMotion = false;
+        let eventOnsetIdx = -1;
+        let eventPeakMotion = 0;
+
+        for (let i = 0; i < motions.length; i++) {
+            if (motions[i] > threshold) {
+                if (!inMotion) {
+                    // Motion onset — this is where the swing starts
+                    eventOnsetIdx = i;
+                    inMotion = true;
+                    eventPeakMotion = motions[i];
+                } else {
+                    if (motions[i] > eventPeakMotion) {
+                        eventPeakMotion = motions[i];
+                    }
+                }
+            } else {
+                if (inMotion) {
+                    // Motion ended
+                    rawEvents.push({
+                        onsetIdx: eventOnsetIdx,
+                        onsetTime: gameplay[eventOnsetIdx].time,
+                        peakMotion: eventPeakMotion,
+                    });
+                    inMotion = false;
+                }
             }
         }
+        // Handle event still active at end of video
+        if (inMotion) {
+            rawEvents.push({
+                onsetIdx: eventOnsetIdx,
+                onsetTime: gameplay[eventOnsetIdx].time,
+                peakMotion: eventPeakMotion,
+            });
+        }
 
-        // Also check for above-threshold even if not a local max (plateaus)
-        if (peaks.length === 0) {
+        // Fallback: if no events found, use the single highest-motion frame
+        if (rawEvents.length === 0) {
             let maxI = 0;
             let maxM = 0;
             for (let i = 0; i < motions.length; i++) {
-                if (motions[i] > maxM) {
-                    maxM = motions[i];
-                    maxI = i;
-                }
+                if (motions[i] > maxM) { maxM = motions[i]; maxI = i; }
             }
             if (maxM > 0) {
-                peaks.push({
-                    idx: maxI + gameplayStartIdx,
-                    motion: maxM,
-                    time: gameplay[maxI].time,
+                rawEvents.push({
+                    onsetIdx: maxI,
+                    onsetTime: gameplay[maxI].time,
+                    peakMotion: maxM,
                 });
             }
         }
 
-        // Merge peaks that are too close together (part of the same swing)
+        // Merge events that are too close together (same swing/play)
         const merged = [];
-        for (const peak of peaks) {
+        for (const evt of rawEvents) {
             if (merged.length > 0) {
                 const last = merged[merged.length - 1];
-                if (peak.time - last.time < minGapSeconds) {
-                    if (peak.motion > last.motion) {
-                        merged[merged.length - 1] = peak;
+                if (evt.onsetTime - last.onsetTime < minGapSeconds) {
+                    // Keep the first onset (the swing), update peak if higher
+                    if (evt.peakMotion > last.peakMotion) {
+                        last.peakMotion = evt.peakMotion;
                     }
                     continue;
                 }
             }
-            merged.push(peak);
+            merged.push({ ...evt });
         }
 
-        // Build swing events with context window
-        const events = merged.map(peak => {
-            const windowBefore = 1.2;
-            const windowAfter = 1.2;
-            const startTime = Math.max(peak.time - windowBefore, samples[gameplayStartIdx].time);
-            const endTime = Math.min(peak.time + windowAfter, samples[samples.length - 1].time);
-
-            const sampleIndices = [];
-            for (let i = 0; i < samples.length; i++) {
-                if (samples[i].time >= startTime && samples[i].time <= endTime) {
-                    sampleIndices.push(i);
-                }
-            }
+        // Build swing events centered on the ONSET, not the peak.
+        // Window: 0.6s before onset (stance/load) + 1.0s after onset
+        // (swing/contact/follow-through). Intentionally short after onset
+        // to avoid capturing running-to-first-base frames.
+        const events = merged.map(evt => {
+            const windowBefore = 0.6;
+            const windowAfter = 1.0;
+            const startTime = Math.max(evt.onsetTime - windowBefore, samples[gameplayStartIdx].time);
+            const endTime = Math.min(evt.onsetTime + windowAfter, samples[samples.length - 1].time);
 
             return {
-                peakTime: peak.time,
-                peakMotion: peak.motion,
+                peakTime: evt.onsetTime,
+                peakMotion: evt.peakMotion,
                 startTime,
                 endTime,
-                sampleIndices,
-                peakIdx: peak.idx,
+                peakIdx: evt.onsetIdx + gameplayStartIdx,
+                sampleIndices: [],
             };
         });
 
@@ -973,21 +1003,27 @@ const SwingAnalyzer = (() => {
             : 'No title card detected. Detecting pitch events...');
 
         // Step 3: Find swing/pitch events (only in gameplay frames)
-        const minGapBetweenPitches = 2.0;
+        const minGapBetweenPitches = 3.0;
         const events = detectSwingEvents(samples, minGapBetweenPitches, gameplayStartIdx);
 
         if (events.length === 0) {
-            // Fallback: use the highest-motion gameplay frame
+            // Fallback: find the first frame with above-average motion
+            // and center a short window around it (onset-based, not peak-based)
             const gameplay = samples.slice(gameplayStartIdx);
             if (gameplay.length > 0) {
-                const sorted = [...gameplay].sort((a, b) => b.batterMotion - a.batterMotion);
-                const peakTime = sorted[0].time;
+                const motions = gameplay.map(s => s.batterMotion);
+                const avgMotion = motions.reduce((a, b) => a + b, 0) / motions.length;
+                let onsetIdx = 0;
+                for (let i = 0; i < motions.length; i++) {
+                    if (motions[i] > avgMotion) { onsetIdx = i; break; }
+                }
+                const onsetTime = gameplay[onsetIdx].time;
                 events.push({
-                    peakTime,
-                    peakMotion: sorted[0].batterMotion,
-                    startTime: Math.max(peakTime - 1.5, gameplayStartTime),
-                    endTime: Math.min(peakTime + 1.5, duration),
-                    peakIdx: samples.indexOf(sorted[0]),
+                    peakTime: onsetTime,
+                    peakMotion: gameplay[onsetIdx].batterMotion,
+                    startTime: Math.max(onsetTime - 0.6, gameplayStartTime),
+                    endTime: Math.min(onsetTime + 1.0, duration),
+                    peakIdx: onsetIdx + gameplayStartIdx,
                     sampleIndices: [],
                 });
             }
