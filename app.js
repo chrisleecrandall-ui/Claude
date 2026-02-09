@@ -1,8 +1,8 @@
 /**
  * Softball Swing Analyzer — Application Controller
  *
- * Handles multi-video upload, per-video outcome tagging,
- * analysis orchestration, comparison, and result rendering.
+ * Handles multi-video upload, per-video outcome tagging (auto-detected from filename),
+ * analysis orchestration, comparison, multi-pitch navigation, and result rendering.
  */
 
 (function () {
@@ -35,6 +35,7 @@
     const resultTitle = $('#result-title');
     const overallScoreEl = $('#overall-score');
     const scoreSummary = $('#score-summary');
+    const pitchTabsContainer = $('#pitch-tabs');
     const phaseTimeline = $('#phase-timeline');
     const phaseFrames = $('#phase-frames');
     const metricsGrid = $('#metrics-grid');
@@ -46,11 +47,28 @@
     const coachingTipsEl = $('#coaching-tips');
     const drillSuggestionsEl = $('#drill-suggestions');
 
+    // ---- All outcome options ----
+    const OUTCOME_OPTIONS = [
+        { value: 'hit', label: 'Hit' },
+        { value: 'single', label: 'Single' },
+        { value: 'double', label: 'Double' },
+        { value: 'triple', label: 'Triple' },
+        { value: 'homerun', label: 'Home Run' },
+        { value: 'out', label: 'Out' },
+        { value: 'strikeout', label: 'Strikeout' },
+        { value: 'miss', label: 'Swing & Miss' },
+        { value: 'foul', label: 'Foul Ball' },
+        { value: 'ball', label: 'Ball (Took)' },
+        { value: 'walk', label: 'Walk' },
+        { value: 'error', label: 'Error' },
+    ];
+
     // ---- State ----
-    let videoFiles = [];       // Array of { file, outcome, id }
+    let videoFiles = [];       // Array of { file, outcome, autoDetected, id }
     let allResults = [];       // Array of { name, outcome, result, config }
     let currentFrameIdx = 0;
     let activeResultIdx = 0;
+    let activePitchIdx = -1;   // -1 means "main result" (last pitch); 0+ = specific pitch
     let nextId = 1;
 
     // ---- Section Management ----
@@ -65,7 +83,6 @@
     // ---- File Upload ----
 
     dropZone.addEventListener('click', (e) => {
-        // Prevent re-triggering when the input's click bubbles back up
         if (e.target === videoInput) return;
         videoInput.click();
     });
@@ -98,7 +115,6 @@
 
     function isVideoFile(file) {
         if (file.type.startsWith('video/')) return true;
-        // Fallback: check extension for files where MIME type is missing (common on mobile)
         const ext = file.name.split('.').pop().toLowerCase();
         return ['mp4', 'mov', 'webm', 'avi', 'm4v', 'mkv'].includes(ext);
     }
@@ -109,9 +125,16 @@
                 alert(`"${file.name}" is too large (max 200MB). Skipping.`);
                 continue;
             }
+
+            // Auto-detect outcome from filename
+            const parsed = SwingAnalyzer.parseFilename(file.name);
+
             videoFiles.push({
                 file,
-                outcome: 'hit',
+                outcome: parsed.outcome,
+                autoDetected: true,
+                opponent: parsed.opponent,
+                description: parsed.description,
                 id: nextId++,
             });
         }
@@ -134,6 +157,22 @@
 
     // ---- Queue Rendering ----
 
+    function buildOutcomeSelect(entry) {
+        const select = document.createElement('select');
+        for (const opt of OUTCOME_OPTIONS) {
+            const option = document.createElement('option');
+            option.value = opt.value;
+            option.textContent = opt.label;
+            select.appendChild(option);
+        }
+        select.value = entry.outcome;
+        select.addEventListener('change', () => {
+            entry.outcome = select.value;
+            entry.autoDetected = false;
+        });
+        return select;
+    }
+
     function renderQueue() {
         videoQueue.innerHTML = '';
 
@@ -153,25 +192,21 @@
             const info = document.createElement('div');
             info.className = 'queue-info';
             const sizeMB = (entry.file.size / (1024 * 1024)).toFixed(1);
-            info.innerHTML = `
-                <div class="queue-name">${entry.file.name}</div>
-                <div class="queue-meta">${sizeMB} MB</div>
-            `;
+            let infoHtml = `<div class="queue-name">${entry.file.name}</div>`;
+            infoHtml += `<div class="queue-meta">${sizeMB} MB`;
+            if (entry.opponent) {
+                infoHtml += ` &mdash; vs ${entry.opponent}`;
+            }
+            if (entry.autoDetected) {
+                infoHtml += ` <span class="auto-detected">(auto-detected)</span>`;
+            }
+            infoHtml += `</div>`;
+            info.innerHTML = infoHtml;
 
             // Outcome selector
             const outcomeWrap = document.createElement('div');
             outcomeWrap.className = 'queue-outcome';
-            const select = document.createElement('select');
-            select.innerHTML = `
-                <option value="hit">Hit</option>
-                <option value="miss">Swing & Miss</option>
-                <option value="foul">Foul Ball</option>
-                <option value="ball">Ball (Took)</option>
-            `;
-            select.value = entry.outcome;
-            select.addEventListener('change', () => {
-                entry.outcome = select.value;
-            });
+            const select = buildOutcomeSelect(entry);
             const label = document.createElement('div');
             label.style.cssText = 'font-size:0.75rem;color:#6b7280;margin-bottom:2px;';
             label.textContent = 'Outcome';
@@ -199,7 +234,6 @@
             videoQueue.appendChild(item);
         });
 
-        // Update button text
         analyzeAllBtn.textContent = videoFiles.length === 1
             ? 'Analyze Swing'
             : `Analyze All ${videoFiles.length} Swings`;
@@ -234,7 +268,6 @@
             };
 
             try {
-                // Create a temporary video element for analysis
                 const videoEl = document.createElement('video');
                 videoEl.src = URL.createObjectURL(entry.file);
                 videoEl.muted = true;
@@ -258,11 +291,11 @@
                 allResults.push({
                     name: entry.file.name,
                     outcome: entry.outcome,
+                    opponent: entry.opponent,
                     result,
                     config,
                 });
 
-                // Clean up
                 URL.revokeObjectURL(videoEl.src);
             } catch (err) {
                 console.error(`Error analyzing ${entry.file.name}:`, err);
@@ -272,6 +305,7 @@
 
         if (allResults.length > 0) {
             activeResultIdx = 0;
+            activePitchIdx = -1;
             renderAllResults();
             showSection('results');
         } else {
@@ -298,7 +332,6 @@
     }
 
     function renderComparison() {
-        // Tabs
         comparisonTabs.innerHTML = '';
         allResults.forEach((r, idx) => {
             const tab = document.createElement('div');
@@ -316,12 +349,12 @@
 
             tab.addEventListener('click', () => {
                 activeResultIdx = idx;
+                activePitchIdx = -1;
                 renderAllResults();
             });
             comparisonTabs.appendChild(tab);
         });
 
-        // Comparison grid — show key metrics across all videos
         comparisonGrid.innerHTML = '';
         const metricKeys = ['batSpeed', 'swingTime', 'hipRotation', 'smoothness', 'levelSwing', 'headStability'];
 
@@ -332,7 +365,6 @@
             const firstMetric = allResults[0].result.metrics[key];
             if (!firstMetric) return;
 
-            // Find the best value
             let bestIdx = 0;
             let bestRating = 0;
             allResults.forEach((r, idx) => {
@@ -362,23 +394,80 @@
     }
 
     function renderSingleResult(idx) {
-        const { name, outcome, result, config } = allResults[idx];
+        const { name, outcome, opponent, result, config } = allResults[idx];
         const outcomeLabel = SwingAnalyzer.OUTCOMES[outcome]
             ? SwingAnalyzer.OUTCOMES[outcome].label
             : 'Hit';
 
+        // Title
+        let title = '';
         if (allResults.length > 1) {
-            resultTitle.textContent = `Swing ${idx + 1}: ${name} (${outcomeLabel})`;
+            title = `Swing ${idx + 1}: ${outcomeLabel}`;
         } else {
-            resultTitle.textContent = `Swing Score (${outcomeLabel})`;
+            title = `Swing Score (${outcomeLabel})`;
+        }
+        if (opponent) title += ` vs ${opponent}`;
+        resultTitle.textContent = title;
+
+        // Pitch tabs (if multiple pitches)
+        renderPitchTabs(result);
+
+        // Show the active pitch data
+        const pitchData = getActivePitchData(result);
+        renderOverallScore(pitchData.overallScore);
+        renderPhaseTimeline(pitchData.phaseEvals);
+        renderMetrics(pitchData.metrics);
+        renderFrameViewer(pitchData.annotatedFrames);
+        renderCoachingTips(pitchData.coachingTips);
+        renderDrills(pitchData.drills);
+    }
+
+    function getActivePitchData(result) {
+        if (activePitchIdx >= 0 && result.pitchResults && result.pitchResults[activePitchIdx]) {
+            return result.pitchResults[activePitchIdx];
+        }
+        // Default: return the main result (last pitch)
+        return result;
+    }
+
+    // -- Pitch Tabs --
+    function renderPitchTabs(result) {
+        if (!pitchTabsContainer) return;
+        if (!result.pitchResults || result.pitchResults.length <= 1) {
+            pitchTabsContainer.classList.add('hidden');
+            return;
         }
 
-        renderOverallScore(result.overallScore);
-        renderPhaseTimeline(result.phaseEvals);
-        renderMetrics(result.metrics);
-        renderFrameViewer(result.annotatedFrames);
-        renderCoachingTips(result.coachingTips);
-        renderDrills(result.drills);
+        pitchTabsContainer.classList.remove('hidden');
+        pitchTabsContainer.innerHTML = '';
+
+        // "Summary" tab (last pitch / at-bat result)
+        const summaryTab = document.createElement('div');
+        summaryTab.className = 'pitch-tab' + (activePitchIdx === -1 ? ' active' : '');
+        summaryTab.innerHTML = `At-Bat Result <span class="pitch-tab-score">${result.overallScore}</span>`;
+        summaryTab.addEventListener('click', () => {
+            activePitchIdx = -1;
+            renderSingleResult(activeResultIdx);
+        });
+        pitchTabsContainer.appendChild(summaryTab);
+
+        // Individual pitch tabs
+        result.pitchResults.forEach((pitch, i) => {
+            const tab = document.createElement('div');
+            tab.className = 'pitch-tab' + (activePitchIdx === i ? ' active' : '');
+
+            const isLast = (i === result.pitchResults.length - 1);
+            const label = isLast ? `Pitch ${pitch.pitchNum} (${pitch.outcomeLabel})` : `Pitch ${pitch.pitchNum}`;
+            const scoreColor = pitch.overallScore >= 70 ? '#10b981'
+                : pitch.overallScore >= 50 ? '#3b82f6' : '#f59e0b';
+
+            tab.innerHTML = `${label} <span class="pitch-tab-score" style="background:${scoreColor}">${pitch.overallScore}</span>`;
+            tab.addEventListener('click', () => {
+                activePitchIdx = i;
+                renderSingleResult(activeResultIdx);
+            });
+            pitchTabsContainer.appendChild(tab);
+        });
     }
 
     // -- Overall Score --
@@ -521,7 +610,7 @@
     function renderCoachingTips(tips) {
         coachingTipsEl.innerHTML = '';
 
-        if (tips.length === 0) {
+        if (!tips || tips.length === 0) {
             coachingTipsEl.innerHTML = '<p>Great swing! No major areas for improvement detected.</p>';
             return;
         }
@@ -543,6 +632,11 @@
     // -- Drills --
     function renderDrills(drills) {
         drillSuggestionsEl.innerHTML = '';
+
+        if (!drills || drills.length === 0) {
+            drillSuggestionsEl.innerHTML = '<p>See the at-bat result for drill suggestions.</p>';
+            return;
+        }
 
         drills.forEach(drill => {
             const div = document.createElement('div');

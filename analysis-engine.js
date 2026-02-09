@@ -1,15 +1,14 @@
 /**
  * Softball Swing Analysis Engine
  *
- * Extracts frames from uploaded video, performs motion analysis by tracking
- * brightness/movement across regions, and evaluates swing mechanics against
- * proper softball hitting fundamentals for each swing phase.
+ * Designed for real-world game footage (GameChanger-style behind-home-plate videos).
+ * Scans full at-bat videos to find individual pitch/swing events, isolates the
+ * batter zone, and analyzes swing mechanics for each detected swing.
  */
 
 const SwingAnalyzer = (() => {
 
     // ---- Swing Phase Definitions ----
-    // Contact phase name is overridden at runtime based on swing outcome
     const PHASES = [
         { id: 'stance',  name: 'Stance / Setup',   color: '#6366f1' },
         { id: 'load',    name: 'Load / Coil',      color: '#8b5cf6' },
@@ -21,13 +20,20 @@ const SwingAnalyzer = (() => {
 
     // Swing outcome types
     const OUTCOMES = {
-        hit:  { label: 'Hit',          contactPhase: 'Contact' },
-        miss: { label: 'Swing & Miss', contactPhase: 'Swing-Through' },
-        foul: { label: 'Foul Ball',    contactPhase: 'Foul Contact' },
-        ball: { label: 'Ball (Took)',  contactPhase: 'Check Swing / Hold' },
+        hit:       { label: 'Hit',           contactPhase: 'Contact' },
+        miss:      { label: 'Swing & Miss',  contactPhase: 'Swing-Through' },
+        foul:      { label: 'Foul Ball',     contactPhase: 'Foul Contact' },
+        ball:      { label: 'Ball (Took)',   contactPhase: 'Check Swing / Hold' },
+        out:       { label: 'Out',           contactPhase: 'Contact' },
+        walk:      { label: 'Walk',          contactPhase: 'Check Swing / Hold' },
+        strikeout: { label: 'Strikeout',     contactPhase: 'Swing-Through' },
+        homerun:   { label: 'Home Run',      contactPhase: 'Contact' },
+        error:     { label: 'Error',         contactPhase: 'Contact' },
+        single:    { label: 'Single',        contactPhase: 'Contact' },
+        double:    { label: 'Double',        contactPhase: 'Contact' },
+        triple:    { label: 'Triple',        contactPhase: 'Contact' },
     };
 
-    // ---- Age-group specific ideal metrics ----
     const AGE_BENCHMARKS = {
         '8u':      { swingTime: [0.6, 0.9],  batAngle: [30, 50], strideLength: [0.3, 0.5], hipRotation: [30, 50] },
         '10u':     { swingTime: [0.5, 0.8],  batAngle: [25, 45], strideLength: [0.35, 0.55], hipRotation: [35, 55] },
@@ -37,67 +43,282 @@ const SwingAnalyzer = (() => {
         'college': { swingTime: [0.25, 0.5], batAngle: [10, 30], strideLength: [0.5, 0.75], hipRotation: [55, 75] },
     };
 
+    // ---- Filename Parsing ----
+
+    /**
+     * Parse GameChanger-style filenames for outcome and context.
+     * Examples:
+     *   "Batter Out, Runners Advance @ TN Fury Platinum Johnson 18U.MP4"
+     *   "Home Run @ Lady Bulldogs 14U.mp4"
+     *   "Strikeout Looking @ Some Team.MOV"
+     */
+    function parseFilename(filename) {
+        const name = filename.replace(/\.[^.]+$/, ''); // strip extension
+        const lower = name.toLowerCase();
+
+        let outcome = 'hit'; // default
+        let description = name;
+
+        // Match common GameChanger outcome patterns
+        const outcomePatterns = [
+            { pattern: /home\s*run/i,                outcome: 'homerun' },
+            { pattern: /triple/i,                    outcome: 'triple' },
+            { pattern: /double/i,                    outcome: 'double' },
+            { pattern: /single/i,                    outcome: 'single' },
+            { pattern: /strikeout|struck\s*out|strike\s*out/i, outcome: 'strikeout' },
+            { pattern: /walk|base\s*on\s*balls|bb/i, outcome: 'walk' },
+            { pattern: /foul/i,                      outcome: 'foul' },
+            { pattern: /batter\s*out|fly\s*out|ground\s*out|pop\s*out|line\s*out/i, outcome: 'out' },
+            { pattern: /hit\s*by\s*pitch|hbp/i,      outcome: 'ball' },
+            { pattern: /error/i,                     outcome: 'error' },
+            { pattern: /hit|base\s*hit/i,            outcome: 'hit' },
+            { pattern: /miss/i,                      outcome: 'miss' },
+            { pattern: /ball/i,                      outcome: 'ball' },
+        ];
+
+        for (const { pattern, outcome: o } of outcomePatterns) {
+            if (pattern.test(name)) {
+                outcome = o;
+                break;
+            }
+        }
+
+        // Try to extract opponent team name (after @ symbol)
+        const atMatch = name.match(/@\s*(.+)/);
+        const opponent = atMatch ? atMatch[1].trim() : null;
+
+        return { outcome, description, opponent };
+    }
+
     // ---- Frame Extraction ----
 
     /**
-     * Extract evenly-spaced frames from a video element.
-     * Returns an array of { canvas, time } objects.
+     * Extract a single frame at a given time from a video element.
      */
-    function extractFrames(videoEl, numFrames = 24, onProgress) {
+    function extractFrameAt(videoEl, time) {
         return new Promise((resolve, reject) => {
-            const duration = videoEl.duration;
-            if (!duration || duration === Infinity) {
-                reject(new Error('Cannot determine video duration'));
-                return;
-            }
-
-            const frames = [];
-            const times = [];
-            // Skip first and last 5% to avoid black/slate frames
-            const start = duration * 0.05;
-            const end = duration * 0.95;
-            const step = (end - start) / (numFrames - 1);
-
-            for (let i = 0; i < numFrames; i++) {
-                times.push(start + step * i);
-            }
-
-            let idx = 0;
-
-            function seekNext() {
-                if (idx >= times.length) {
-                    resolve(frames);
-                    return;
-                }
-                videoEl.currentTime = times[idx];
-            }
-
+            videoEl.currentTime = time;
             videoEl.onseeked = () => {
                 const canvas = document.createElement('canvas');
                 canvas.width = videoEl.videoWidth;
                 canvas.height = videoEl.videoHeight;
                 const ctx = canvas.getContext('2d');
                 ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
-
-                frames.push({ canvas, time: times[idx] });
-                idx++;
-                if (onProgress) {
-                    onProgress(idx / times.length, 'Extracting frames...');
-                }
-                // Small delay to allow UI update
-                requestAnimationFrame(seekNext);
+                resolve({ canvas, time });
             };
-
             videoEl.onerror = () => reject(new Error('Error seeking video'));
-            seekNext();
         });
     }
 
-    // ---- Motion Analysis ----
+    /**
+     * Quick-scan the video at regular intervals to build a motion timeline.
+     * Returns array of { time, motion, batterMotion } for each sample point.
+     */
+    async function scanVideoMotion(videoEl, sampleInterval, onProgress) {
+        const duration = videoEl.duration;
+        if (!duration || duration === Infinity) {
+            throw new Error('Cannot determine video duration');
+        }
+
+        const samples = [];
+        const times = [];
+        const start = 0.5; // skip first half-second
+        const end = Math.max(duration - 0.5, start + 1);
+
+        for (let t = start; t <= end; t += sampleInterval) {
+            times.push(t);
+        }
+
+        // Extract all sample frames
+        let prevCanvas = null;
+        for (let i = 0; i < times.length; i++) {
+            const frame = await extractFrameAt(videoEl, times[i]);
+
+            if (prevCanvas) {
+                const fullMotion = motionBetween(prevCanvas, frame.canvas);
+                const batterMotion = batterZoneMotion(prevCanvas, frame.canvas);
+                samples.push({
+                    time: times[i],
+                    motion: fullMotion,
+                    batterMotion: batterMotion,
+                    canvas: frame.canvas,
+                });
+            } else {
+                samples.push({
+                    time: times[i],
+                    motion: 0,
+                    batterMotion: 0,
+                    canvas: frame.canvas,
+                });
+            }
+            prevCanvas = frame.canvas;
+
+            if (onProgress) {
+                onProgress(i / times.length);
+            }
+        }
+
+        return samples;
+    }
+
+    // ---- Batter Zone Detection ----
 
     /**
-     * Compute overall pixel-difference "motion score" between two canvases.
+     * For behind-home-plate view, the batter is in the lower-center area.
+     * We define a "batter zone" covering the area where the batter stands.
+     * Returns motion score for just the batter region.
      */
+    function batterZoneMotion(canvasA, canvasB) {
+        const w = canvasA.width;
+        const h = canvasA.height;
+
+        // Batter zone: lower 60% of frame height, center 50% of width
+        // This captures the batter from both sides of the plate
+        const zoneX = Math.floor(w * 0.15);
+        const zoneW = Math.floor(w * 0.70);
+        const zoneY = Math.floor(h * 0.30);
+        const zoneH = Math.floor(h * 0.60);
+
+        const ctxA = canvasA.getContext('2d');
+        const ctxB = canvasB.getContext('2d');
+        const dataA = ctxA.getImageData(zoneX, zoneY, zoneW, zoneH).data;
+        const dataB = ctxB.getImageData(zoneX, zoneY, zoneW, zoneH).data;
+
+        let diff = 0;
+        const step = 8;
+        for (let i = 0; i < dataA.length; i += 4 * step) {
+            diff += Math.abs(dataA[i] - dataB[i]);
+            diff += Math.abs(dataA[i + 1] - dataB[i + 1]);
+            diff += Math.abs(dataA[i + 2] - dataB[i + 2]);
+        }
+        const totalPx = (dataA.length / 4) / step;
+        return diff / (totalPx * 3 * 255);
+    }
+
+    /**
+     * Compute motion in sub-regions of the batter zone (left/right/upper/lower).
+     */
+    function batterRegionMotion(canvasA, canvasB) {
+        const w = canvasA.width;
+        const h = canvasA.height;
+        const ctxA = canvasA.getContext('2d');
+        const ctxB = canvasB.getContext('2d');
+
+        // Batter zone bounds
+        const zX = Math.floor(w * 0.15);
+        const zW = Math.floor(w * 0.70);
+        const zY = Math.floor(h * 0.30);
+        const zH = Math.floor(h * 0.60);
+
+        // Split into quadrants within batter zone
+        const regions = {
+            upper: { x: zX, y: zY, w: zW, h: Math.floor(zH * 0.45) },
+            lower: { x: zX, y: zY + Math.floor(zH * 0.45), w: zW, h: zH - Math.floor(zH * 0.45) },
+            left:  { x: zX, y: zY, w: Math.floor(zW * 0.5), h: zH },
+            right: { x: zX + Math.floor(zW * 0.5), y: zY, w: zW - Math.floor(zW * 0.5), h: zH },
+        };
+
+        const result = {};
+        for (const [name, r] of Object.entries(regions)) {
+            const dA = ctxA.getImageData(r.x, r.y, r.w, r.h).data;
+            const dB = ctxB.getImageData(r.x, r.y, r.w, r.h).data;
+            let diff = 0;
+            const step = 12;
+            for (let i = 0; i < dA.length; i += 4 * step) {
+                diff += Math.abs(dA[i] - dB[i]);
+                diff += Math.abs(dA[i + 1] - dB[i + 1]);
+                diff += Math.abs(dA[i + 2] - dB[i + 2]);
+            }
+            const px = (dA.length / 4) / step;
+            result[name] = diff / (px * 3 * 255);
+        }
+        return result;
+    }
+
+    // ---- Pitch/Swing Event Detection ----
+
+    /**
+     * Detect individual swing/pitch events from the motion timeline.
+     * A swing event is a sharp spike in batter-zone motion.
+     * Returns array of { peakTime, startTime, endTime, peakMotion, sampleIndices }
+     */
+    function detectSwingEvents(samples, minGapSeconds) {
+        if (samples.length < 3) return [];
+
+        // Use batter-zone motion to find peaks
+        const motions = samples.map(s => s.batterMotion);
+
+        // Compute adaptive threshold: mean + 1.5 * stddev of batter motion
+        const mean = motions.reduce((a, b) => a + b, 0) / motions.length;
+        const variance = motions.reduce((a, b) => a + (b - mean) ** 2, 0) / motions.length;
+        const stddev = Math.sqrt(variance);
+        const threshold = Math.max(mean + 1.5 * stddev, mean * 2, 0.015);
+
+        // Find peaks above threshold
+        const peaks = [];
+        for (let i = 1; i < motions.length - 1; i++) {
+            if (motions[i] > threshold && motions[i] >= motions[i - 1] && motions[i] >= motions[i + 1]) {
+                peaks.push({ idx: i, motion: motions[i], time: samples[i].time });
+            }
+        }
+
+        // Also check if any point is above threshold even if not a local max
+        // (handles plateaus)
+        if (peaks.length === 0) {
+            for (let i = 0; i < motions.length; i++) {
+                if (motions[i] > threshold) {
+                    peaks.push({ idx: i, motion: motions[i], time: samples[i].time });
+                    break; // Just grab the first one
+                }
+            }
+        }
+
+        // Merge peaks that are too close together (part of the same swing)
+        const merged = [];
+        for (const peak of peaks) {
+            if (merged.length > 0) {
+                const last = merged[merged.length - 1];
+                if (peak.time - last.time < minGapSeconds) {
+                    // Part of the same event — keep the bigger one
+                    if (peak.motion > last.motion) {
+                        merged[merged.length - 1] = peak;
+                    }
+                    continue;
+                }
+            }
+            merged.push(peak);
+        }
+
+        // Build swing events with context frames
+        const events = merged.map(peak => {
+            // Find the window around this peak: ~1s before, ~1s after
+            const windowBefore = 1.0;
+            const windowAfter = 1.0;
+            const startTime = Math.max(peak.time - windowBefore, samples[0].time);
+            const endTime = Math.min(peak.time + windowAfter, samples[samples.length - 1].time);
+
+            const sampleIndices = [];
+            for (let i = 0; i < samples.length; i++) {
+                if (samples[i].time >= startTime && samples[i].time <= endTime) {
+                    sampleIndices.push(i);
+                }
+            }
+
+            return {
+                peakTime: peak.time,
+                peakMotion: peak.motion,
+                startTime,
+                endTime,
+                sampleIndices,
+                peakIdx: peak.idx,
+            };
+        });
+
+        return events;
+    }
+
+    // ---- Full Motion Between Two Canvases ----
+
     function motionBetween(canvasA, canvasB) {
         const w = canvasA.width;
         const h = canvasA.height;
@@ -107,95 +328,36 @@ const SwingAnalyzer = (() => {
         const dataB = ctxB.getImageData(0, 0, w, h).data;
 
         let diff = 0;
-        const step = 16; // Sample every 16th pixel for speed
+        const step = 16;
         for (let i = 0; i < dataA.length; i += 4 * step) {
-            diff += Math.abs(dataA[i] - dataB[i]);       // R
-            diff += Math.abs(dataA[i + 1] - dataB[i + 1]); // G
-            diff += Math.abs(dataA[i + 2] - dataB[i + 2]); // B
+            diff += Math.abs(dataA[i] - dataB[i]);
+            diff += Math.abs(dataA[i + 1] - dataB[i + 1]);
+            diff += Math.abs(dataA[i + 2] - dataB[i + 2]);
         }
         const totalPixels = (dataA.length / 4) / step;
-        return diff / (totalPixels * 3 * 255); // Normalize 0-1
+        return diff / (totalPixels * 3 * 255);
     }
 
-    /**
-     * Compute motion scores in specific regions of the frame.
-     * Regions: upper (bat/hands), middle (torso/hips), lower (legs/feet)
-     */
-    function regionMotion(canvasA, canvasB) {
-        const w = canvasA.width;
-        const h = canvasA.height;
-        const ctxA = canvasA.getContext('2d');
-        const ctxB = canvasB.getContext('2d');
+    // ---- Extract Detailed Frames Around a Swing Event ----
 
-        const regions = {
-            upper: { y1: 0, y2: Math.floor(h * 0.33) },
-            middle: { y1: Math.floor(h * 0.33), y2: Math.floor(h * 0.66) },
-            lower: { y1: Math.floor(h * 0.66), y2: h },
-        };
+    async function extractSwingFrames(videoEl, event, numFrames) {
+        const frames = [];
+        const step = (event.endTime - event.startTime) / (numFrames - 1);
 
-        const result = {};
-
-        for (const [name, { y1, y2 }] of Object.entries(regions)) {
-            const regionH = y2 - y1;
-            const dataA = ctxA.getImageData(0, y1, w, regionH).data;
-            const dataB = ctxB.getImageData(0, y1, w, regionH).data;
-
-            let diff = 0;
-            const step = 12;
-            for (let i = 0; i < dataA.length; i += 4 * step) {
-                diff += Math.abs(dataA[i] - dataB[i]);
-                diff += Math.abs(dataA[i + 1] - dataB[i + 1]);
-                diff += Math.abs(dataA[i + 2] - dataB[i + 2]);
-            }
-            const totalPx = (dataA.length / 4) / step;
-            result[name] = diff / (totalPx * 3 * 255);
+        for (let i = 0; i < numFrames; i++) {
+            const t = event.startTime + step * i;
+            const frame = await extractFrameAt(videoEl, t);
+            frames.push(frame);
         }
-
-        return result;
+        return frames;
     }
 
-    /**
-     * Analyze horizontal center-of-mass shift (approximate weight transfer).
-     */
-    function horizontalShift(canvasA, canvasB) {
-        function centerOfBrightness(canvas) {
-            const w = canvas.width;
-            const h = canvas.height;
-            const ctx = canvas.getContext('2d');
-            const data = ctx.getImageData(0, 0, w, h).data;
-            let totalWeight = 0;
-            let weightedX = 0;
-            const step = 20;
-            for (let y = 0; y < h; y += step) {
-                for (let x = 0; x < w; x += step) {
-                    const i = (y * w + x) * 4;
-                    const brightness = (data[i] + data[i + 1] + data[i + 2]) / 3;
-                    // Invert: darker regions (the batter) carry more weight
-                    const weight = 255 - brightness;
-                    totalWeight += weight;
-                    weightedX += weight * x;
-                }
-            }
-            return totalWeight > 0 ? weightedX / totalWeight / w : 0.5;
-        }
+    // ---- Phase Detection (works on extracted swing frames) ----
 
-        const cxA = centerOfBrightness(canvasA);
-        const cxB = centerOfBrightness(canvasB);
-        return cxB - cxA; // Positive = moved right
-    }
-
-    // ---- Phase Detection ----
-
-    /**
-     * Given motion scores per frame, classify each frame into a swing phase.
-     * outcome: 'hit' | 'miss' | 'foul' | 'ball'
-     * For 'ball' (took the pitch), we shorten/skip the swing and contact phases.
-     */
     function detectPhases(motionScores, regionScores, outcome) {
         const n = motionScores.length;
         const phases = new Array(n).fill(0);
 
-        // Find the frame with maximum motion (likely contact/swing)
         let maxMotion = 0;
         let peakIdx = 0;
         for (let i = 0; i < n; i++) {
@@ -205,7 +367,6 @@ const SwingAnalyzer = (() => {
             }
         }
 
-        // Find the onset of major motion (load start)
         const threshold = maxMotion * 0.15;
         let motionStart = 0;
         for (let i = 0; i < peakIdx; i++) {
@@ -216,16 +377,14 @@ const SwingAnalyzer = (() => {
         }
 
         let loadEnd, strideEnd, swingEnd, contactEnd;
+        const isNoSwing = outcome === 'ball' || outcome === 'walk';
 
-        if (outcome === 'ball') {
-            // Ball taken — there's minimal or no swing
-            // Mostly stance/load, possibly a small stride or check swing
+        if (isNoSwing) {
             loadEnd = motionStart + Math.floor((peakIdx - motionStart) * 0.5);
             strideEnd = peakIdx;
-            swingEnd = peakIdx;       // No real swing
-            contactEnd = peakIdx;     // No contact
+            swingEnd = peakIdx;
+            contactEnd = peakIdx;
         } else {
-            // Hit, miss, or foul — full swing happened
             loadEnd = motionStart + Math.floor((peakIdx - motionStart) * 0.3);
             strideEnd = motionStart + Math.floor((peakIdx - motionStart) * 0.6);
             swingEnd = peakIdx;
@@ -233,12 +392,12 @@ const SwingAnalyzer = (() => {
         }
 
         for (let i = 0; i < n; i++) {
-            if (i < motionStart) phases[i] = 0;        // stance
-            else if (i < loadEnd) phases[i] = 1;       // load
-            else if (i < strideEnd) phases[i] = 2;     // stride
-            else if (i < swingEnd) phases[i] = 3;      // swing
-            else if (i <= contactEnd) phases[i] = 4;    // contact / swing-through
-            else phases[i] = 5;                         // follow-through
+            if (i < motionStart) phases[i] = 0;
+            else if (i < loadEnd) phases[i] = 1;
+            else if (i < strideEnd) phases[i] = 2;
+            else if (i < swingEnd) phases[i] = 3;
+            else if (i <= contactEnd) phases[i] = 4;
+            else phases[i] = 5;
         }
 
         return { phases, peakIdx, motionStart, loadEnd, strideEnd, swingEnd, contactEnd, outcome };
@@ -250,49 +409,55 @@ const SwingAnalyzer = (() => {
         const { phases, peakIdx, motionStart } = phaseData;
         const benchmarks = AGE_BENCHMARKS[config.ageGroup] || AGE_BENCHMARKS['12u'];
         const duration = frames[frames.length - 1].time - frames[0].time;
-        const frameDuration = duration / frames.length;
+        const frameDuration = duration / Math.max(frames.length, 1);
 
-        // Swing time: from load start to contact
-        const swingFrames = peakIdx - motionStart;
+        const swingFrames = Math.max(peakIdx - motionStart, 1);
         const swingTime = swingFrames * frameDuration;
 
-        // Bat speed proxy: max upper-region motion
-        const upperMotions = regionScores.map(r => r.upper);
+        // Bat speed: max batter-zone motion (upper region = bat area)
+        const upperMotions = regionScores.map(r => r.upper || 0);
         const maxBatSpeed = Math.max(...upperMotions);
 
-        // Hip rotation proxy: middle-region motion during swing phase
+        // Hip rotation: lower region motion during swing
         const hipMotions = regionScores
-            .map((r, i) => phases[i] === 3 ? r.middle : 0)
+            .map((r, i) => phases[i] === 3 ? (r.lower || 0) : 0)
             .filter(v => v > 0);
         const avgHipRotation = hipMotions.length > 0
             ? hipMotions.reduce((a, b) => a + b, 0) / hipMotions.length
             : 0;
 
-        // Weight transfer: horizontal shift from stance to contact
-        const stanceFrame = frames[0].canvas;
-        const contactFrame = frames[peakIdx] ? frames[peakIdx].canvas : frames[frames.length - 1].canvas;
-        const weightTransfer = Math.abs(horizontalShift(stanceFrame, contactFrame));
+        // Weight transfer: left-right shift
+        const leftMotions = regionScores.map(r => r.left || 0);
+        const rightMotions = regionScores.map(r => r.right || 0);
+        const leftTotal = leftMotions.reduce((a, b) => a + b, 0);
+        const rightTotal = rightMotions.reduce((a, b) => a + b, 0);
+        const weightTransfer = Math.abs(leftTotal - rightTotal) / Math.max(leftTotal + rightTotal, 0.001);
 
-        // Smoothness: standard deviation of motion scores during swing
+        // Smoothness
         const swingMotions = motionScores.slice(motionStart, peakIdx + 1);
-        const meanSwing = swingMotions.reduce((a, b) => a + b, 0) / swingMotions.length;
-        const swingVariance = swingMotions.reduce((a, b) => a + (b - meanSwing) ** 2, 0) / swingMotions.length;
-        const smoothness = 1 - Math.min(Math.sqrt(swingVariance) / meanSwing, 1);
+        const meanSwing = swingMotions.length > 0
+            ? swingMotions.reduce((a, b) => a + b, 0) / swingMotions.length
+            : 0;
+        const swingVariance = swingMotions.length > 0
+            ? swingMotions.reduce((a, b) => a + (b - meanSwing) ** 2, 0) / swingMotions.length
+            : 0;
+        const smoothness = meanSwing > 0
+            ? 1 - Math.min(Math.sqrt(swingVariance) / meanSwing, 1)
+            : 0.5;
 
         // Level swing: compare upper vs lower motion during swing
         const swingUpperAvg = regionScores
             .slice(motionStart, peakIdx + 1)
-            .reduce((a, r) => a + r.upper, 0) / swingFrames;
+            .reduce((a, r) => a + (r.upper || 0), 0) / swingFrames;
         const swingLowerAvg = regionScores
             .slice(motionStart, peakIdx + 1)
-            .reduce((a, r) => a + r.lower, 0) / swingFrames;
+            .reduce((a, r) => a + (r.lower || 0), 0) / swingFrames;
         const levelSwing = 1 - Math.abs(swingUpperAvg - swingLowerAvg) / Math.max(swingUpperAvg, swingLowerAvg, 0.001);
 
-        // Head stability: motion in top 20% of frame during swing
-        // (approximated from upper region)
-        const headStability = 1 - (swingUpperAvg * 2); // Less upper motion = more stable head
+        // Head stability: less upper motion = more stable
+        const headStability = Math.max(0, 1 - (swingUpperAvg * 2));
 
-        // Follow-through completeness: total motion after contact
+        // Follow-through
         const followMotions = motionScores.slice(peakIdx + 1);
         const followThrough = followMotions.length > 0
             ? followMotions.reduce((a, b) => a + b, 0) / followMotions.length
@@ -321,7 +486,7 @@ const SwingAnalyzer = (() => {
                 value: Math.round(weightTransfer * 100) + '%',
                 raw: weightTransfer,
                 name: 'Weight Transfer',
-                rating: rateValue(weightTransfer, [0.01, 0.03, 0.06]),
+                rating: rateValue(weightTransfer, [0.05, 0.15, 0.25]),
             },
             smoothness: {
                 value: Math.round(smoothness * 100) + '%',
@@ -336,10 +501,10 @@ const SwingAnalyzer = (() => {
                 rating: rateValue(levelSwing, [0.4, 0.6, 0.8]),
             },
             headStability: {
-                value: Math.round(Math.max(0, headStability) * 100) + '%',
-                raw: Math.max(0, headStability),
+                value: Math.round(headStability * 100) + '%',
+                raw: headStability,
                 name: 'Head Stability',
-                rating: rateValue(Math.max(0, headStability), [0.3, 0.5, 0.7]),
+                rating: rateValue(headStability, [0.3, 0.5, 0.7]),
             },
             followThrough: {
                 value: Math.round(followThrough * 1000) + '',
@@ -370,44 +535,46 @@ const SwingAnalyzer = (() => {
         return 'poor';
     }
 
+    function ratingToNum(rating) {
+        return { excellent: 4, good: 3, fair: 2, poor: 1 }[rating] || 2;
+    }
+
     // ---- Phase Evaluation ----
 
     function evaluatePhases(frames, motionScores, regionScores, phaseData, metrics, config) {
-        const { phases, peakIdx, motionStart, loadEnd, strideEnd, swingEnd, contactEnd } = phaseData;
+        const { phases, peakIdx, motionStart, loadEnd, strideEnd } = phaseData;
         const outcome = config.outcome || 'hit';
+        const isNoSwing = outcome === 'ball' || outcome === 'walk';
         const evaluations = [];
 
         // Stance
-        const stanceMotions = motionScores.slice(0, motionStart);
-        const stanceStill = stanceMotions.length > 0
-            ? stanceMotions.reduce((a, b) => a + b, 0) / stanceMotions.length
-            : 0;
+        const stanceMotions = motionScores.slice(0, Math.max(motionStart, 1));
+        const stanceStill = stanceMotions.reduce((a, b) => a + b, 0) / Math.max(stanceMotions.length, 1);
         const stanceScore = Math.round(Math.max(0, (1 - stanceStill * 20)) * 100);
         evaluations.push({
             phase: PHASES[0],
-            score: stanceScore,
-            observations: buildStanceObservations(stanceStill, stanceScore),
+            score: Math.min(100, stanceScore),
+            observations: buildStanceObs(stanceStill, stanceScore),
         });
 
         // Load
-        const loadMotions = motionScores.slice(motionStart, loadEnd);
-        const loadRegions = regionScores.slice(motionStart, loadEnd);
-        const loadUpperAvg = loadRegions.reduce((a, r) => a + r.upper, 0) / Math.max(loadRegions.length, 1);
+        const loadRegions = regionScores.slice(motionStart, Math.max(loadEnd, motionStart + 1));
+        const loadUpperAvg = loadRegions.reduce((a, r) => a + (r.upper || 0), 0) / Math.max(loadRegions.length, 1);
         const loadScore = Math.round(Math.min(100, 40 + loadUpperAvg * 800));
         evaluations.push({
             phase: PHASES[1],
             score: loadScore,
-            observations: buildLoadObservations(loadUpperAvg, loadScore),
+            observations: buildLoadObs(loadUpperAvg, loadScore),
         });
 
         // Stride
-        const strideRegions = regionScores.slice(loadEnd, strideEnd);
-        const strideLowerAvg = strideRegions.reduce((a, r) => a + r.lower, 0) / Math.max(strideRegions.length, 1);
+        const strideRegions = regionScores.slice(loadEnd, Math.max(strideEnd, loadEnd + 1));
+        const strideLowerAvg = strideRegions.reduce((a, r) => a + (r.lower || 0), 0) / Math.max(strideRegions.length, 1);
         const strideScore = Math.round(Math.min(100, 40 + strideLowerAvg * 600));
         evaluations.push({
             phase: PHASES[2],
             score: strideScore,
-            observations: buildStrideObservations(strideLowerAvg, strideScore),
+            observations: buildStrideObs(strideLowerAvg, strideScore),
         });
 
         // Swing
@@ -419,23 +586,22 @@ const SwingAnalyzer = (() => {
         evaluations.push({
             phase: PHASES[3],
             score: swingScore,
-            observations: buildSwingObservations(metrics, swingScore),
+            observations: buildSwingObs(metrics, swingScore),
         });
 
-        // Contact / Swing-Through — adapts based on outcome
+        // Contact
         const outcomeInfo = OUTCOMES[outcome] || OUTCOMES.hit;
         const contactPhase = { ...PHASES[4], name: outcomeInfo.contactPhase };
 
-        if (outcome === 'ball') {
-            // Ball taken — evaluate discipline instead of contact
-            const disciplineScore = Math.round(
+        if (isNoSwing) {
+            const discScore = Math.round(
                 (ratingToNum(metrics.headStability.rating) * 0.5 +
                  ratingToNum(metrics.smoothness.rating) * 0.5) * 25
             );
             evaluations.push({
                 phase: contactPhase,
-                score: disciplineScore,
-                observations: buildBallTakenObservations(metrics, disciplineScore),
+                score: discScore,
+                observations: { good: ['Good plate discipline'], improve: [] },
             });
         } else {
             const contactScore = Math.round(
@@ -446,7 +612,7 @@ const SwingAnalyzer = (() => {
             evaluations.push({
                 phase: contactPhase,
                 score: contactScore,
-                observations: buildContactObservations(metrics, contactScore, outcome),
+                observations: buildContactObs(metrics, contactScore, outcome),
             });
         }
 
@@ -458,189 +624,101 @@ const SwingAnalyzer = (() => {
         evaluations.push({
             phase: PHASES[5],
             score: ftScore,
-            observations: buildFollowThroughObservations(metrics, ftScore),
+            observations: buildFollowObs(metrics, ftScore),
         });
 
         return evaluations;
     }
 
-    function ratingToNum(rating) {
-        return { excellent: 4, good: 3, fair: 2, poor: 1 }[rating] || 2;
-    }
+    // ---- Observation Builders (compact) ----
 
-    // ---- Observation Builders ----
-
-    function buildStanceObservations(stillness, score) {
-        const good = [];
-        const improve = [];
-
-        if (score >= 70) {
-            good.push('Good pre-swing stillness — balanced and ready');
-        } else {
-            improve.push('Too much movement before the pitch — focus on being still and balanced');
-        }
-
-        if (score >= 80) {
-            good.push('Appears to have a solid athletic base');
-        }
-
+    function buildStanceObs(stillness, score) {
+        const good = [], improve = [];
+        if (score >= 70) good.push('Good pre-swing stillness — balanced and ready');
+        else improve.push('Too much movement before the pitch — focus on being still and balanced');
+        if (score >= 80) good.push('Solid athletic base');
         if (score < 50) {
-            improve.push('Work on keeping weight evenly distributed on balls of feet');
-            improve.push('Hands should be near the back shoulder, bat at roughly 45 degrees');
-        } else if (score < 70) {
-            improve.push('Try to relax the upper body while maintaining a ready position');
+            improve.push('Keep weight evenly distributed on balls of feet');
+            improve.push('Hands should be near back shoulder, bat at roughly 45 degrees');
         }
-
         return { good, improve };
     }
 
-    function buildLoadObservations(upperMotion, score) {
-        const good = [];
-        const improve = [];
-
-        if (score >= 70) {
-            good.push('Good loading action detected — hands and weight shift back');
-        } else if (score >= 50) {
+    function buildLoadObs(upperMotion, score) {
+        const good = [], improve = [];
+        if (score >= 70) good.push('Good loading action — hands and weight shift back');
+        else if (score >= 50) {
             good.push('Some loading motion present');
-            improve.push('Try a more deliberate load: shift weight slightly to back foot, hands back');
+            improve.push('Try a more deliberate load: shift weight to back foot, hands back');
         } else {
             improve.push('Minimal load detected — the load creates power for the swing');
-            improve.push('Practice "loading the gun": shift hands and weight to back side before swing');
         }
-
-        if (upperMotion > 0.06) {
-            improve.push('Load may be too big — keep it compact and controlled');
-        }
-
+        if (upperMotion > 0.06) improve.push('Load may be too big — keep it compact');
         return { good, improve };
     }
 
-    function buildStrideObservations(lowerMotion, score) {
-        const good = [];
-        const improve = [];
-
-        if (score >= 70) {
-            good.push('Good stride toward the pitcher — front foot lands softly');
-        } else if (score >= 50) {
+    function buildStrideObs(lowerMotion, score) {
+        const good = [], improve = [];
+        if (score >= 70) good.push('Good stride toward the pitcher');
+        else if (score >= 50) {
             good.push('Stride is present but could be more controlled');
-            improve.push('Stride should be short and soft — "walk on thin ice"');
+            improve.push('Stride should be short and soft');
         } else {
-            improve.push('Stride needs work — should be a short, controlled step toward pitcher');
-            improve.push('Landing on the ball of the front foot keeps the hands back and body loaded');
+            improve.push('Stride needs work — short, controlled step toward pitcher');
         }
-
-        if (lowerMotion > 0.08) {
-            improve.push('Stride may be too long — a shorter stride keeps you balanced');
-        }
-
+        if (lowerMotion > 0.08) improve.push('Stride may be too long');
         return { good, improve };
     }
 
-    function buildSwingObservations(metrics, score) {
-        const good = [];
-        const improve = [];
-
-        if (metrics.batSpeed.rating === 'excellent' || metrics.batSpeed.rating === 'good') {
+    function buildSwingObs(metrics, score) {
+        const good = [], improve = [];
+        if (metrics.batSpeed.rating === 'excellent' || metrics.batSpeed.rating === 'good')
             good.push('Good bat speed through the zone');
-        } else {
-            improve.push('Work on generating more bat speed — start with the hips, not the hands');
-        }
-
-        if (metrics.levelSwing.rating === 'excellent' || metrics.levelSwing.rating === 'good') {
-            good.push('Swing path is level through the hitting zone');
-        } else {
-            improve.push('Swing path could be more level — avoid chopping down or uppercutting');
-        }
-
-        if (metrics.smoothness.rating === 'excellent' || metrics.smoothness.rating === 'good') {
+        else improve.push('Work on generating more bat speed — start with the hips');
+        if (metrics.levelSwing.rating === 'excellent' || metrics.levelSwing.rating === 'good')
+            good.push('Level swing path through the hitting zone');
+        else improve.push('Swing path could be more level');
+        if (metrics.smoothness.rating === 'excellent' || metrics.smoothness.rating === 'good')
             good.push('Smooth, fluid swing mechanics');
-        } else {
-            improve.push('Swing could be smoother — jerky swings lose power and consistency');
-        }
-
-        if (metrics.hipRotation.rating === 'poor') {
-            improve.push('More hip rotation needed — "squish the bug" with the back foot to drive rotation');
-        } else if (metrics.hipRotation.rating === 'excellent') {
-            good.push('Strong hip rotation generating power');
-        }
-
+        else improve.push('Swing could be smoother');
+        if (metrics.hipRotation.rating === 'excellent') good.push('Strong hip rotation');
+        else if (metrics.hipRotation.rating === 'poor') improve.push('More hip rotation needed — "squish the bug"');
         return { good, improve };
     }
 
-    function buildContactObservations(metrics, score, outcome) {
-        const good = [];
-        const improve = [];
+    function buildContactObs(metrics, score, outcome) {
+        const good = [], improve = [];
+        if (metrics.headStability.rating === 'excellent' || metrics.headStability.rating === 'good')
+            good.push('Good head stability — eyes on the ball');
+        else improve.push('Head moving too much — keep eyes on the ball');
 
-        if (metrics.headStability.rating === 'excellent' || metrics.headStability.rating === 'good') {
-            good.push('Good head stability — eyes stay on the ball');
-        } else {
-            improve.push('Head is moving too much — focus on keeping your head still and eyes on the ball');
-        }
-
-        if (outcome === 'miss') {
-            improve.push('Swing and miss — the swing mechanics still matter even without contact');
-            improve.push('On a miss, check: were eyes tracking the ball all the way? Was timing early or late?');
-            if (metrics.levelSwing.rating === 'poor' || metrics.levelSwing.rating === 'fair') {
-                improve.push('A more level swing path stays in the hitting zone longer, giving more margin for contact');
-            }
+        if (outcome === 'miss' || outcome === 'strikeout') {
+            improve.push('Swing and miss — check timing and eye tracking');
+            if (metrics.levelSwing.rating === 'poor' || metrics.levelSwing.rating === 'fair')
+                improve.push('A more level swing stays in the zone longer');
         } else if (outcome === 'foul') {
-            improve.push('Foul ball — close to making solid contact');
-            if (score >= 60) {
-                good.push('Swing mechanics look reasonable — the timing or pitch location may need adjustment');
-            } else {
-                improve.push('Check if the bat is getting to the contact zone too early (pulling off) or too late');
-            }
+            improve.push('Foul ball — close to solid contact, check timing');
+        } else if (outcome === 'out') {
+            if (score >= 60) good.push('Made contact — check pitch selection and placement');
+            else improve.push('Work on making harder contact');
         } else {
-            // Hit
-            if (score >= 70) {
-                good.push('Contact point appears to be out in front with arms extended');
-            } else {
-                improve.push('Work on contacting the ball out in front of the plate');
-                improve.push('Arms should be extended but not fully locked at contact');
-            }
+            // hit, homerun, single, double, triple, error
+            if (score >= 70) good.push('Solid contact out front with arms extended');
+            else improve.push('Work on contacting the ball out in front');
         }
-
         return { good, improve };
     }
 
-    function buildBallTakenObservations(metrics, score) {
-        const good = [];
-        const improve = [];
-
-        good.push('Good plate discipline — chose not to swing');
-
-        if (metrics.headStability.rating === 'excellent' || metrics.headStability.rating === 'good') {
-            good.push('Head stayed still while tracking the pitch');
-        } else {
-            improve.push('Even when taking a pitch, keep the head still and eyes level to track the ball');
+    function buildFollowObs(metrics, score) {
+        const good = [], improve = [];
+        if (metrics.followThrough.rating === 'excellent' || metrics.followThrough.rating === 'good')
+            good.push('Full follow-through');
+        else {
+            improve.push('Follow-through is short — let the bat finish its path');
+            improve.push('Swing through the ball, not at it');
         }
-
-        if (score >= 60) {
-            good.push('Stayed balanced and in a ready position');
-        } else {
-            improve.push('Work on staying balanced in your stance when taking a pitch — stay ready for the next one');
-        }
-
-        return { good, improve };
-    }
-
-    function buildFollowThroughObservations(metrics, score) {
-        const good = [];
-        const improve = [];
-
-        if (metrics.followThrough.rating === 'excellent' || metrics.followThrough.rating === 'good') {
-            good.push('Full follow-through — bat finishes high over the front shoulder');
-        } else {
-            improve.push('Follow-through is short — let the bat finish its natural path');
-            improve.push('A full follow-through means you accelerated through the ball, not at it');
-        }
-
-        if (score >= 70) {
-            good.push('Good weight transfer to the front side on follow-through');
-        } else {
-            improve.push('Transfer your weight fully to the front foot after contact');
-        }
-
+        if (score >= 70) good.push('Good weight transfer to front side');
+        else improve.push('Transfer weight fully to front foot after contact');
         return { good, improve };
     }
 
@@ -648,323 +726,115 @@ const SwingAnalyzer = (() => {
 
     function computeOverallScore(metrics, phaseEvals) {
         const metricWeights = {
-            batSpeed: 0.15,
-            swingTime: 0.10,
-            hipRotation: 0.10,
-            weightTransfer: 0.10,
-            smoothness: 0.15,
-            levelSwing: 0.15,
-            headStability: 0.15,
-            followThrough: 0.10,
+            batSpeed: 0.15, swingTime: 0.10, hipRotation: 0.10, weightTransfer: 0.10,
+            smoothness: 0.15, levelSwing: 0.15, headStability: 0.15, followThrough: 0.10,
         };
-
         let metricScore = 0;
         for (const [key, weight] of Object.entries(metricWeights)) {
-            if (metrics[key]) {
-                metricScore += ratingToNum(metrics[key].rating) * 25 * weight;
-            }
+            if (metrics[key]) metricScore += ratingToNum(metrics[key].rating) * 25 * weight;
         }
-
         const phaseAvg = phaseEvals.reduce((a, e) => a + e.score, 0) / phaseEvals.length;
-
         return Math.round(metricScore * 0.5 + phaseAvg * 0.5);
     }
 
-    // ---- Coaching Tips Generator ----
+    // ---- Coaching Tips ----
 
     function generateCoachingTips(metrics, phaseEvals, config) {
         const tips = [];
         const outcome = config.outcome || 'hit';
 
-        // Identify weakest areas
-        const weakMetrics = Object.entries(metrics)
-            .filter(([, m]) => m.rating === 'poor' || m.rating === 'fair')
-            .sort((a, b) => ratingToNum(a[1].rating) - ratingToNum(b[1].rating));
-
-        const weakPhases = [...phaseEvals]
-            .sort((a, b) => a.score - b.score);
-
-        // Outcome-specific tips
-        if (outcome === 'miss') {
-            tips.push({
-                priority: 'high',
-                icon: '👀',
-                title: 'Track the Ball All the Way',
-                detail: 'On a swing and miss, the most common cause is losing sight of the ball. Practice keeping your eye on the ball from the pitcher\'s hand all the way to the bat. A common cue is "see the ball hit the bat." Soft toss and tee work help build this habit.',
-            });
+        if (outcome === 'miss' || outcome === 'strikeout') {
+            tips.push({ priority: 'high', icon: '👀', title: 'Track the Ball',
+                detail: 'On a miss, the most common cause is losing the ball. Practice "see the ball hit the bat." Soft toss and tee work build this habit.' });
         } else if (outcome === 'foul') {
-            tips.push({
-                priority: 'medium',
-                icon: '🔧',
-                title: 'Timing Adjustment',
-                detail: 'A foul ball often means the timing or bat angle is slightly off. If fouling to the pull side, you may be early — try waiting a fraction longer. If fouling to the opposite field, you may be late — start the swing a bit earlier.',
-            });
-        } else if (outcome === 'ball') {
-            tips.push({
-                priority: 'low',
-                icon: '👏',
-                title: 'Good Pitch Recognition',
-                detail: 'Taking a ball shows pitch discipline. Continue to develop the ability to recognize ball vs. strike early out of the pitcher\'s hand. This is one of the most valuable skills in softball.',
-            });
+            tips.push({ priority: 'medium', icon: '🔧', title: 'Timing Adjustment',
+                detail: 'A foul ball means timing or bat angle is slightly off. Fouling pull-side = early, opposite-field = late.' });
+        } else if (outcome === 'ball' || outcome === 'walk') {
+            tips.push({ priority: 'low', icon: '👏', title: 'Good Pitch Recognition',
+                detail: 'Taking a ball shows discipline. Continue developing the ability to read ball vs. strike out of the hand.' });
         }
 
-        // Hip rotation
-        if (metrics.hipRotation.rating === 'poor' || metrics.hipRotation.rating === 'fair') {
-            tips.push({
-                priority: 'high',
-                icon: '🔄',
-                title: 'Improve Hip Rotation',
-                detail: 'Power in softball comes from the ground up through the hips. Focus on "squishing the bug" — rotate the back foot as your hips fire open toward the pitcher. The hands follow the hips, not the other way around.',
-            });
-        }
+        if (metrics.hipRotation.rating === 'poor' || metrics.hipRotation.rating === 'fair')
+            tips.push({ priority: 'high', icon: '🔄', title: 'Improve Hip Rotation',
+                detail: 'Power comes from the ground up through the hips. "Squish the bug" — rotate the back foot as hips fire open.' });
+        if (metrics.batSpeed.rating === 'poor' || metrics.batSpeed.rating === 'fair')
+            tips.push({ priority: 'high', icon: '⚡', title: 'Increase Bat Speed',
+                detail: 'Start with explosive hip rotation. Keep hands inside the ball, take a direct path to contact.' });
+        if (metrics.levelSwing.rating === 'poor' || metrics.levelSwing.rating === 'fair')
+            tips.push({ priority: 'high', icon: '📐', title: 'Level Your Swing Path',
+                detail: 'Swing through a "tunnel" — keep the bat in the hitting zone as long as possible.' });
+        if (metrics.headStability.rating === 'poor' || metrics.headStability.rating === 'fair')
+            tips.push({ priority: 'medium', icon: '👁', title: 'Keep Head Still',
+                detail: 'Head movement makes it harder to track the ball. Keep chin tucked, eyes level.' });
+        if (metrics.smoothness.rating === 'poor' || metrics.smoothness.rating === 'fair')
+            tips.push({ priority: 'medium', icon: '🌊', title: 'Smooth Out Your Swing',
+                detail: 'The swing should be one connected motion. Start relaxed, let load flow into stride into swing.' });
+        if (metrics.followThrough.rating === 'poor' || metrics.followThrough.rating === 'fair')
+            tips.push({ priority: 'medium', icon: '🏌', title: 'Complete Follow-Through',
+                detail: 'A short follow-through means deceleration before contact. Bat should finish over front shoulder.' });
 
-        // Bat speed
-        if (metrics.batSpeed.rating === 'poor' || metrics.batSpeed.rating === 'fair') {
-            tips.push({
-                priority: 'high',
-                icon: '⚡',
-                title: 'Increase Bat Speed',
-                detail: 'Bat speed starts with a strong load and explosive hip rotation. Keep your hands inside the ball and take a direct path to contact. Avoid "casting" — swinging the bat in a wide arc away from your body.',
-            });
-        }
-
-        // Level swing
-        if (metrics.levelSwing.rating === 'poor' || metrics.levelSwing.rating === 'fair') {
-            tips.push({
-                priority: 'high',
-                icon: '📐',
-                title: 'Level Out Your Swing Path',
-                detail: 'A slight upswing (launch angle) is ideal in softball. Avoid chopping down at the ball or extreme uppercuts. Think about swinging through a "tunnel" where the bat stays in the hitting zone as long as possible.',
-            });
-        }
-
-        // Head stability
-        if (metrics.headStability.rating === 'poor' || metrics.headStability.rating === 'fair') {
-            tips.push({
-                priority: 'medium',
-                icon: '👁',
-                title: 'Keep Your Head Still',
-                detail: 'Your head is moving during the swing, which makes it harder to track the ball. Practice keeping your chin tucked and eyes level. Your head should turn to follow the ball, but should not move up/down or forward/back.',
-            });
-        }
-
-        // Smoothness
-        if (metrics.smoothness.rating === 'poor' || metrics.smoothness.rating === 'fair') {
-            tips.push({
-                priority: 'medium',
-                icon: '🌊',
-                title: 'Smooth Out Your Swing',
-                detail: 'A smooth, fluid swing is more consistent and powerful. Start relaxed in your stance, let the load flow naturally into the stride, and the swing should be one connected motion — not a series of separate movements.',
-            });
-        }
-
-        // Follow-through
-        if (metrics.followThrough.rating === 'poor' || metrics.followThrough.rating === 'fair') {
-            tips.push({
-                priority: 'medium',
-                icon: '🏌',
-                title: 'Complete Your Follow-Through',
-                detail: 'A short follow-through means you decelerated before contact. Swing through the ball, not at it. The bat should finish over your front shoulder with your chest facing the pitcher.',
-            });
-        }
-
-        // Weight transfer
-        if (metrics.weightTransfer.rating === 'poor') {
-            tips.push({
-                priority: 'medium',
-                icon: '⚖',
-                title: 'Improve Weight Transfer',
-                detail: 'Good hitters transfer weight from back foot to front foot during the swing. Practice a rhythmic load (back) and stride (forward) to get your body moving into the ball.',
-            });
-        }
-
-        // Phase-specific weak areas
-        if (weakPhases[0] && weakPhases[0].score < 50) {
-            const phase = weakPhases[0];
-            tips.push({
-                priority: 'low',
-                icon: '🎯',
-                title: `Focus Area: ${phase.phase.name}`,
-                detail: `Your ${phase.phase.name.toLowerCase()} phase scored lowest. Spend extra time on drills that isolate this part of your swing. Break the swing into parts and practice each one slowly before putting it together.`,
-            });
-        }
-
-        // Age-specific encouragement
-        if (['8u', '10u'].includes(config.ageGroup)) {
-            tips.push({
-                priority: 'low',
-                icon: '⭐',
-                title: 'Keep Having Fun!',
-                detail: 'At this age, the most important thing is developing a love for the game. Focus on one improvement at a time and celebrate progress. Mechanics will naturally improve with practice and repetition.',
-            });
-        }
+        if (['8u', '10u'].includes(config.ageGroup))
+            tips.push({ priority: 'low', icon: '⭐', title: 'Keep Having Fun!',
+                detail: 'Focus on one improvement at a time. Mechanics improve naturally with repetition and love of the game.' });
 
         return tips;
     }
 
-    // ---- Drill Suggestions ----
+    // ---- Drills ----
 
     function generateDrills(metrics, phaseEvals, config) {
         const drills = [];
 
-        if (metrics.hipRotation.rating !== 'excellent') {
-            drills.push({
-                name: 'Fence Drill',
-                purpose: 'Teaches proper hip rotation and hand path',
-                steps: [
-                    'Stand with your back about 6 inches from a fence or net',
-                    'Take your normal stance facing the fence with your bat',
-                    'Take dry swings — if you hit the fence, your swing is too wide',
-                    'Focus on firing the hips first and keeping hands inside',
-                    'Do 3 sets of 10 swings',
-                ],
-            });
-        }
+        if (metrics.hipRotation.rating !== 'excellent')
+            drills.push({ name: 'Fence Drill', purpose: 'Teaches hip rotation and hand path',
+                steps: ['Stand 6 inches from a fence', 'Take dry swings — don\'t hit the fence', 'Fire hips first, keep hands inside', '3 sets of 10'] });
+        if (metrics.batSpeed.rating !== 'excellent')
+            drills.push({ name: 'Overload/Underload Training', purpose: 'Builds bat speed',
+                steps: ['10 swings with a heavier bat', 'Switch to game bat for 10 swings', 'Repeat 3 rounds', 'Rest 1-2 min between rounds'] });
+        if (metrics.levelSwing.rating !== 'excellent')
+            drills.push({ name: 'High/Low Tee Drill', purpose: 'Consistent swing path at all heights',
+                steps: ['Hit 10 at belt height', 'Hit 10 at low zone', 'Hit 10 at high zone', 'Adjust with legs, not swing plane'] });
+        if (metrics.headStability.rating !== 'excellent')
+            drills.push({ name: 'Balance Beam Tee', purpose: 'Head stability and balance',
+                steps: ['Stand on a 2x4 board in batting stance', 'Hit off tee while balanced', 'If you fall off, too much movement', '3 sets of 10'] });
 
-        if (metrics.batSpeed.rating !== 'excellent') {
-            drills.push({
-                name: 'Overload / Underload Training',
-                purpose: 'Builds bat speed through variable resistance',
-                steps: [
-                    'Take 10 swings with a heavier bat or donut on your bat',
-                    'Immediately switch to your game bat and take 10 swings',
-                    'The lighter bat will feel faster, training your fast-twitch muscles',
-                    'Repeat for 3 rounds',
-                    'Rest 1-2 minutes between rounds',
-                ],
-            });
-        }
-
-        if (metrics.levelSwing.rating !== 'excellent') {
-            drills.push({
-                name: 'High Tee / Low Tee Drill',
-                purpose: 'Develops a consistent level swing path at different pitch heights',
-                steps: [
-                    'Set a tee at belt height and hit 10 balls focusing on a level swing',
-                    'Move the tee to low strike zone — hit 10 more with the same path',
-                    'Move the tee to high strike zone — hit 10 more',
-                    'Focus on adjusting with your legs, not your swing plane',
-                    'Hit line drives, not fly balls or grounders',
-                ],
-            });
-        }
-
-        if (metrics.headStability.rating !== 'excellent') {
-            drills.push({
-                name: 'Balance Beam Tee Drill',
-                purpose: 'Improves head stability and balance throughout the swing',
-                steps: [
-                    'Place a 2x4 board on the ground (or use a line)',
-                    'Stand on the board in your batting stance',
-                    'Hit off a tee while staying balanced on the board',
-                    'If you fall off, you\'re moving your head/body too much',
-                    'Do 3 sets of 10 swings',
-                ],
-            });
-        }
-
-        if (metrics.smoothness.rating !== 'excellent') {
-            drills.push({
-                name: 'Slow Motion Swings',
-                purpose: 'Builds muscle memory for a fluid, connected swing',
-                steps: [
-                    'Take your stance and go through your swing in ultra slow motion',
-                    'Take 10 seconds for each swing — feel every position',
-                    'Check each phase: stance, load, stride, swing, contact, follow-through',
-                    'Gradually speed up while maintaining the same feel',
-                    'Do 5 slow, 5 medium, 5 full speed',
-                ],
-            });
-        }
-
-        drills.push({
-            name: 'Front Toss / Soft Toss',
-            purpose: 'General timing and contact practice',
-            steps: [
-                'Have a partner kneel to the side and toss balls into the strike zone',
-                'Focus on seeing the ball early and making solid contact',
-                'Hit each ball back up the middle',
-                'Do 3 rounds of 15 swings',
-                'Alternate between inside, middle, and outside pitches',
-            ],
-        });
-
-        if (config.ageGroup === '14u' || config.ageGroup === '16u' || config.ageGroup === 'college') {
-            drills.push({
-                name: 'Opposite Field Hitting',
-                purpose: 'Develops bat control and ability to use the whole field',
-                steps: [
-                    'Set up a tee on the outside part of the plate',
-                    'Focus on hitting the ball to the opposite field',
-                    'Keep your front shoulder closed and hands inside the ball',
-                    'Let the ball travel deeper before making contact',
-                    'Do 3 sets of 10, alternating with middle and pull-side swings',
-                ],
-            });
-        }
+        drills.push({ name: 'Front Toss / Soft Toss', purpose: 'Timing and contact',
+            steps: ['Partner tosses into strike zone from the side', 'Focus on solid contact up the middle', '3 rounds of 15 swings'] });
 
         return drills;
     }
 
-    // ---- Draw Annotations on Frame ----
+    // ---- Frame Annotation ----
 
-    function annotateFrame(canvas, frameIdx, phaseData, regionScores, motionScores, outcome) {
+    function annotateFrame(canvas, phaseIdx, phaseName, phaseColor, motionScore, outcome, pitchNum) {
         const ctx = canvas.getContext('2d');
         const w = canvas.width;
         const h = canvas.height;
-        const phaseIdx = phaseData.phases[frameIdx];
-        let phase = PHASES[phaseIdx];
 
-        // Override contact phase name based on outcome
-        if (phaseIdx === 4 && outcome) {
-            const info = OUTCOMES[outcome] || OUTCOMES.hit;
-            phase = { ...phase, name: info.contactPhase };
-        }
-
-        // Scale font sizes relative to video resolution
         const scale = Math.max(w / 640, 1);
         const labelFontSize = Math.round(18 * scale);
         const numberFontSize = Math.round(28 * scale);
         const smallFontSize = Math.round(12 * scale);
         const pad = Math.round(10 * scale);
 
-        // Draw region grid overlay
-        ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
-        ctx.lineWidth = 1;
-        ctx.setLineDash([5, 5]);
-        ctx.beginPath();
-        ctx.moveTo(0, h * 0.33);
-        ctx.lineTo(w, h * 0.33);
-        ctx.moveTo(0, h * 0.66);
-        ctx.lineTo(w, h * 0.66);
-        ctx.stroke();
+        // Batter zone outline
+        const zoneX = Math.floor(w * 0.15);
+        const zoneW = Math.floor(w * 0.70);
+        const zoneY = Math.floor(h * 0.30);
+        const zoneH = Math.floor(h * 0.60);
+        ctx.strokeStyle = 'rgba(255, 255, 0, 0.4)';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([8, 4]);
+        ctx.strokeRect(zoneX, zoneY, zoneW, zoneH);
         ctx.setLineDash([]);
 
-        // Draw motion heatmap bars on the right side
-        if (regionScores[frameIdx]) {
-            const regions = regionScores[frameIdx];
-            const barWidth = Math.round(10 * scale);
-            const barX = w - barWidth - pad;
-
-            const drawBar = (yStart, yEnd, value) => {
-                const maxH = yEnd - yStart;
-                const barH = value * maxH * 10;
-                ctx.fillStyle = `rgba(255, ${Math.round(255 - value * 2550)}, 0, 0.7)`;
-                ctx.fillRect(barX, yEnd - barH, barWidth, barH);
-            };
-
-            drawBar(0, h * 0.33, regions.upper);
-            drawBar(h * 0.33, h * 0.66, regions.middle);
-            drawBar(h * 0.66, h, regions.lower);
-        }
-
-        // ---- Phase number badge (top-left circle) ----
-        const badgeRadius = Math.round(22 * scale);
-        const badgeX = pad + badgeRadius;
-        const badgeY = pad + badgeRadius;
+        // Phase badge
+        const badgeR = Math.round(22 * scale);
+        const bx = pad + badgeR;
+        const by = pad + badgeR;
         ctx.beginPath();
-        ctx.arc(badgeX, badgeY, badgeRadius, 0, Math.PI * 2);
-        ctx.fillStyle = phase.color;
+        ctx.arc(bx, by, badgeR, 0, Math.PI * 2);
+        ctx.fillStyle = phaseColor;
         ctx.fill();
         ctx.strokeStyle = 'white';
         ctx.lineWidth = 2 * scale;
@@ -973,60 +843,51 @@ const SwingAnalyzer = (() => {
         ctx.font = `bold ${numberFontSize}px sans-serif`;
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
-        ctx.fillText(String(phaseIdx + 1), badgeX, badgeY);
+        ctx.fillText(String(phaseIdx + 1), bx, by);
 
-        // ---- Phase name label (next to badge) ----
+        // Phase label
         ctx.font = `bold ${labelFontSize}px sans-serif`;
         ctx.textAlign = 'left';
         ctx.textBaseline = 'top';
-        const labelText = phase.name;
-        const textMetrics = ctx.measureText(labelText);
-        const labelX = badgeX + badgeRadius + pad;
+        const labelX = bx + badgeR + pad;
         const labelY = pad;
-        const labelPadH = Math.round(6 * scale);
-        const labelPadW = Math.round(10 * scale);
-        const labelH = labelFontSize + labelPadH * 2;
-        const labelW = textMetrics.width + labelPadW * 2;
+        const tm = ctx.measureText(phaseName);
+        const lPad = Math.round(8 * scale);
+        const lH = labelFontSize + lPad * 2;
+        const lW = tm.width + lPad * 2;
 
-        // Background pill
         ctx.fillStyle = 'rgba(0, 0, 0, 0.65)';
-        const pillRadius = Math.round(6 * scale);
-        ctx.beginPath();
-        ctx.moveTo(labelX + pillRadius, labelY);
-        ctx.lineTo(labelX + labelW - pillRadius, labelY);
-        ctx.quadraticCurveTo(labelX + labelW, labelY, labelX + labelW, labelY + pillRadius);
-        ctx.lineTo(labelX + labelW, labelY + labelH - pillRadius);
-        ctx.quadraticCurveTo(labelX + labelW, labelY + labelH, labelX + labelW - pillRadius, labelY + labelH);
-        ctx.lineTo(labelX + pillRadius, labelY + labelH);
-        ctx.quadraticCurveTo(labelX, labelY + labelH, labelX, labelY + labelH - pillRadius);
-        ctx.lineTo(labelX, labelY + pillRadius);
-        ctx.quadraticCurveTo(labelX, labelY, labelX + pillRadius, labelY);
-        ctx.closePath();
-        ctx.fill();
-
-        // Colored left accent bar
-        ctx.fillStyle = phase.color;
-        ctx.fillRect(labelX, labelY, Math.round(4 * scale), labelH);
-
-        // Text
+        ctx.fillRect(labelX, labelY, lW, lH);
+        ctx.fillStyle = phaseColor;
+        ctx.fillRect(labelX, labelY, Math.round(4 * scale), lH);
         ctx.fillStyle = 'white';
-        ctx.fillText(labelText, labelX + labelPadW, labelY + labelPadH);
+        ctx.fillText(phaseName, labelX + lPad, labelY + lPad);
 
-        // ---- Motion score bar at bottom ----
-        const motion = motionScores[frameIdx] || 0;
+        // Pitch number (if multi-pitch)
+        if (pitchNum !== undefined) {
+            const pitchLabel = `Pitch ${pitchNum}`;
+            ctx.font = `bold ${smallFontSize}px sans-serif`;
+            ctx.textAlign = 'right';
+            const pw = ctx.measureText(pitchLabel).width + lPad * 2;
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.65)';
+            ctx.fillRect(w - pad - pw, pad, pw, smallFontSize + lPad * 2);
+            ctx.fillStyle = '#fbbf24';
+            ctx.fillText(pitchLabel, w - pad - lPad, pad + lPad + smallFontSize * 0.8);
+        }
+
+        // Motion bar
         const barH = Math.round(20 * scale);
-        const mBarW = Math.min(motion * w * 5, w - pad * 2);
+        const mBarW = Math.min(motionScore * w * 5, w - pad * 2);
         ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
         ctx.fillRect(pad, h - barH - pad, w - pad * 2, barH);
-        ctx.fillStyle = phase.color;
+        ctx.fillStyle = phaseColor;
         ctx.fillRect(pad, h - barH - pad, mBarW, barH);
         ctx.fillStyle = 'white';
         ctx.font = `${smallFontSize}px sans-serif`;
         ctx.textAlign = 'left';
         ctx.textBaseline = 'middle';
-        ctx.fillText('Motion: ' + (motion * 100).toFixed(1), pad + 5, h - barH / 2 - pad);
+        ctx.fillText('Batter Motion: ' + (motionScore * 100).toFixed(1), pad + 5, h - barH / 2 - pad);
 
-        // Reset text alignment
         ctx.textAlign = 'start';
         ctx.textBaseline = 'alphabetic';
     }
@@ -1034,102 +895,165 @@ const SwingAnalyzer = (() => {
     // ---- Main Analysis Pipeline ----
 
     async function analyze(videoEl, config, onProgress) {
-        onProgress(0, 'Preparing video...');
+        onProgress(0, 'Scanning video for swing events...');
 
-        // Step 1: Extract frames
-        const frames = await extractFrames(videoEl, 24, (p, msg) => {
-            onProgress(p * 0.4, msg);
+        const duration = videoEl.duration;
+        // Determine scan rate based on video length
+        // Short videos (<5s) = high detail, long videos = coarser scan
+        const sampleInterval = duration > 10 ? 0.3 : 0.15;
+
+        // Step 1: Scan the entire video for motion
+        const samples = await scanVideoMotion(videoEl, sampleInterval, (p) => {
+            onProgress(p * 0.3, 'Scanning video for swing events...');
         });
 
-        if (frames.length < 6) {
-            throw new Error('Could not extract enough frames. Try a longer video.');
+        onProgress(0.3, 'Detecting pitch events...');
+
+        // Step 2: Find swing/pitch events
+        const minGapBetweenPitches = 2.0; // seconds
+        const events = detectSwingEvents(samples, minGapBetweenPitches);
+
+        if (events.length === 0) {
+            // Fallback: if no clear events found, analyze the whole video as one swing
+            // Use the highest-motion portion
+            const sorted = [...samples].sort((a, b) => b.batterMotion - a.batterMotion);
+            const peakTime = sorted[0].time;
+            events.push({
+                peakTime,
+                peakMotion: sorted[0].batterMotion,
+                startTime: Math.max(peakTime - 1.5, 0),
+                endTime: Math.min(peakTime + 1.5, duration),
+                peakIdx: samples.indexOf(sorted[0]),
+                sampleIndices: [],
+            });
         }
 
-        onProgress(0.4, 'Analyzing motion...');
+        onProgress(0.35, `Found ${events.length} pitch event(s). Analyzing...`);
 
-        // Step 2: Compute motion between consecutive frames
-        const motionScores = [0];
-        const regionScores = [{ upper: 0, middle: 0, lower: 0 }];
+        // Step 3: Analyze each swing event
+        const pitchResults = [];
 
-        for (let i = 1; i < frames.length; i++) {
-            motionScores.push(motionBetween(frames[i - 1].canvas, frames[i].canvas));
-            regionScores.push(regionMotion(frames[i - 1].canvas, frames[i].canvas));
-            onProgress(0.4 + (i / frames.length) * 0.2, 'Analyzing motion...');
+        for (let e = 0; e < events.length; e++) {
+            const event = events[e];
+            const pitchNum = e + 1;
+            const pctBase = 0.35 + (e / events.length) * 0.55;
+            const pctEach = 0.55 / events.length;
+
+            onProgress(pctBase, `Analyzing pitch ${pitchNum} of ${events.length}...`);
+
+            // Extract detailed frames around this swing event
+            const frames = await extractSwingFrames(videoEl, event, 16);
+
+            // Compute batter-zone motion between consecutive frames
+            const motionScores = [0];
+            const regionScores = [{ upper: 0, lower: 0, left: 0, right: 0 }];
+
+            for (let i = 1; i < frames.length; i++) {
+                motionScores.push(batterZoneMotion(frames[i - 1].canvas, frames[i].canvas));
+                regionScores.push(batterRegionMotion(frames[i - 1].canvas, frames[i].canvas));
+            }
+
+            // Determine outcome for this specific pitch
+            // Last event gets the at-bat outcome; earlier events are intermediate pitches
+            const isLastPitch = (e === events.length - 1);
+            const pitchOutcome = isLastPitch ? (config.outcome || 'hit') : 'ball';
+
+            const phaseData = detectPhases(motionScores, regionScores, pitchOutcome);
+            const metrics = computeMetrics(frames, motionScores, regionScores, phaseData, config);
+            const phaseEvals = evaluatePhases(frames, motionScores, regionScores, phaseData, metrics,
+                { ...config, outcome: pitchOutcome });
+            const overallScore = computeOverallScore(metrics, phaseEvals);
+            const coachingTips = isLastPitch
+                ? generateCoachingTips(metrics, phaseEvals, { ...config, outcome: pitchOutcome })
+                : [];
+            const drills = isLastPitch ? generateDrills(metrics, phaseEvals, config) : [];
+
+            // Annotate key frames
+            const keyIndices = [
+                0,
+                phaseData.motionStart,
+                Math.min(phaseData.loadEnd, frames.length - 1),
+                Math.min(phaseData.strideEnd, frames.length - 1),
+                Math.min(phaseData.peakIdx, frames.length - 1),
+                Math.min(phaseData.contactEnd + 1, frames.length - 1),
+            ];
+            // Deduplicate
+            const uniqueIndices = [...new Set(keyIndices)].sort((a, b) => a - b);
+
+            const outcomeInfo = OUTCOMES[pitchOutcome] || OUTCOMES.hit;
+            const annotatedFrames = uniqueIndices.map(idx => {
+                const frame = frames[idx];
+                const ac = document.createElement('canvas');
+                ac.width = frame.canvas.width;
+                ac.height = frame.canvas.height;
+                const ctx = ac.getContext('2d');
+                ctx.drawImage(frame.canvas, 0, 0);
+
+                const pi = phaseData.phases[idx];
+                let phaseName = PHASES[pi].name;
+                if (pi === 4) phaseName = outcomeInfo.contactPhase;
+                const phaseColor = PHASES[pi].color;
+                const motion = motionScores[idx] || 0;
+
+                annotateFrame(ac, pi, phaseName, phaseColor, motion, pitchOutcome,
+                    events.length > 1 ? pitchNum : undefined);
+
+                return {
+                    canvas: ac,
+                    time: frame.time,
+                    phase: { ...PHASES[pi], name: phaseName },
+                    frameIdx: idx,
+                };
+            });
+
+            onProgress(pctBase + pctEach, `Pitch ${pitchNum} analyzed.`);
+
+            pitchResults.push({
+                pitchNum,
+                outcome: pitchOutcome,
+                outcomeLabel: outcomeInfo.label,
+                peakTime: event.peakTime,
+                overallScore,
+                metrics,
+                phaseEvals,
+                coachingTips,
+                drills,
+                annotatedFrames,
+                motionScores,
+                regionScores,
+                phaseData,
+                frames,
+            });
         }
 
-        onProgress(0.6, 'Detecting swing phases...');
+        onProgress(0.95, 'Finalizing...');
 
-        // Step 3: Detect phases
-        const outcome = config.outcome || 'hit';
-        const phaseData = detectPhases(motionScores, regionScores, outcome);
-
-        onProgress(0.7, 'Computing metrics...');
-
-        // Step 4: Compute metrics
-        const metrics = computeMetrics(frames, motionScores, regionScores, phaseData, config);
-
-        onProgress(0.8, 'Evaluating swing phases...');
-
-        // Step 5: Evaluate each phase
-        const phaseEvals = evaluatePhases(frames, motionScores, regionScores, phaseData, metrics, config);
-
-        onProgress(0.85, 'Generating coaching tips...');
-
-        // Step 6: Overall score
-        const overallScore = computeOverallScore(metrics, phaseEvals);
-
-        // Step 7: Generate coaching tips and drills
-        const coachingTips = generateCoachingTips(metrics, phaseEvals, config);
-        const drills = generateDrills(metrics, phaseEvals, config);
-
-        onProgress(0.9, 'Preparing annotated frames...');
-
-        // Step 8: Annotate key frames
-        const keyFrameIndices = [
-            0,                          // Stance
-            phaseData.motionStart,      // Load start
-            phaseData.loadEnd,          // Stride start
-            phaseData.strideEnd,        // Swing start
-            phaseData.peakIdx,          // Contact
-            Math.min(phaseData.contactEnd + 1, frames.length - 1), // Follow-through
-        ];
-
-        const annotatedFrames = keyFrameIndices.map(idx => {
-            const frame = frames[idx];
-            // Create a copy to annotate
-            const annotCanvas = document.createElement('canvas');
-            annotCanvas.width = frame.canvas.width;
-            annotCanvas.height = frame.canvas.height;
-            const ctx = annotCanvas.getContext('2d');
-            ctx.drawImage(frame.canvas, 0, 0);
-            annotateFrame(annotCanvas, idx, phaseData, regionScores, motionScores, outcome);
-            return {
-                canvas: annotCanvas,
-                time: frame.time,
-                phase: PHASES[phaseData.phases[idx]],
-                frameIdx: idx,
-            };
-        });
+        // The "main" result is the last pitch (the at-bat outcome)
+        const mainResult = pitchResults[pitchResults.length - 1];
 
         onProgress(1.0, 'Analysis complete!');
 
         return {
-            overallScore,
-            metrics,
-            phaseEvals,
-            coachingTips,
-            drills,
-            annotatedFrames,
-            motionScores,
-            regionScores,
-            phaseData,
-            frames,
+            overallScore: mainResult.overallScore,
+            metrics: mainResult.metrics,
+            phaseEvals: mainResult.phaseEvals,
+            coachingTips: mainResult.coachingTips,
+            drills: mainResult.drills,
+            annotatedFrames: mainResult.annotatedFrames,
+            motionScores: mainResult.motionScores,
+            regionScores: mainResult.regionScores,
+            phaseData: mainResult.phaseData,
+            frames: mainResult.frames,
+            // Multi-pitch data
+            pitchResults,
+            pitchCount: pitchResults.length,
         };
     }
 
     // ---- Public API ----
     return {
         analyze,
+        parseFilename,
         PHASES,
         OUTCOMES,
     };

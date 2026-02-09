@@ -714,6 +714,61 @@ main {
     color: white;
 }
 
+/* ===== Pitch Tabs ===== */
+.pitch-tabs {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    margin-bottom: 1.25rem;
+    padding: 0.75rem;
+    background: var(--bg-card);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+}
+
+.pitch-tab {
+    padding: 0.45rem 0.85rem;
+    border: 2px solid var(--border);
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 0.85rem;
+    font-weight: 600;
+    background: var(--bg);
+    transition: all 0.15s;
+    white-space: nowrap;
+}
+
+.pitch-tab:hover {
+    border-color: var(--accent);
+}
+
+.pitch-tab.active {
+    border-color: var(--accent);
+    background: var(--accent);
+    color: white;
+}
+
+.pitch-tab .pitch-tab-score {
+    display: inline-block;
+    margin-left: 0.35rem;
+    padding: 0.1rem 0.4rem;
+    border-radius: 4px;
+    font-size: 0.75rem;
+    color: white;
+    background: var(--primary);
+}
+
+.pitch-tab.active .pitch-tab-score {
+    background: rgba(255, 255, 255, 0.3);
+}
+
+/* ===== Auto-detected badge ===== */
+.auto-detected {
+    color: var(--success);
+    font-weight: 600;
+    font-size: 0.75rem;
+}
+
 /* ===== Footer ===== */
 footer {
     text-align: center;
