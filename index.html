@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Softball Swing Analyzer</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <header>
+        <h1>Softball Swing Analyzer</h1>
+        <p class="subtitle">Upload a video to get detailed swing analysis and coaching tips</p>
+    </header>
+
+    <main>
+        <!-- Upload Section -->
+        <section id="upload-section" class="card">
+            <div id="drop-zone" class="drop-zone">
+                <div class="drop-zone-content">
+                    <svg class="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                        <polyline points="17 8 12 3 7 8"/>
+                        <line x1="12" y1="3" x2="12" y2="15"/>
+                    </svg>
+                    <p class="drop-text">Drag & drop a video here</p>
+                    <p class="drop-subtext">or click to browse</p>
+                    <p class="supported-formats">Supports MP4, MOV, WebM (max 200MB)</p>
+                </div>
+                <input type="file" id="video-input" accept="video/*" hidden>
+            </div>
+
+            <div id="video-tips" class="tips-box">
+                <h3>Tips for best results:</h3>
+                <ul>
+                    <li>Film from the <strong>side view</strong> (third-base side for right-handed batters)</li>
+                    <li>Keep the camera <strong>steady</strong> — use a tripod if possible</li>
+                    <li>Make sure the <strong>full body</strong> is visible from feet to bat</li>
+                    <li>Good lighting helps — outdoor daylight is ideal</li>
+                    <li>Record in <strong>slow motion</strong> if your phone supports it</li>
+                </ul>
+            </div>
+        </section>
+
+        <!-- Video Preview Section -->
+        <section id="preview-section" class="card hidden">
+            <h2>Video Preview</h2>
+            <div class="video-container">
+                <video id="video-player" controls></video>
+            </div>
+            <div class="controls-row">
+                <button id="analyze-btn" class="btn btn-primary">Analyze Swing</button>
+                <button id="change-video-btn" class="btn btn-secondary">Change Video</button>
+            </div>
+            <div id="analysis-config" class="config-panel">
+                <h3>Analysis Settings</h3>
+                <div class="config-grid">
+                    <label>
+                        <span>Batter Handedness</span>
+                        <select id="handedness">
+                            <option value="right">Right-Handed</option>
+                            <option value="left">Left-Handed</option>
+                        </select>
+                    </label>
+                    <label>
+                        <span>Pitch Type</span>
+                        <select id="pitch-type">
+                            <option value="general">General / Unknown</option>
+                            <option value="fastball">Fastball</option>
+                            <option value="changeup">Changeup</option>
+                            <option value="riseball">Riseball</option>
+                            <option value="dropball">Dropball</option>
+                            <option value="curveball">Curveball</option>
+                        </select>
+                    </label>
+                    <label>
+                        <span>Age Group</span>
+                        <select id="age-group">
+                            <option value="8u">8U</option>
+                            <option value="10u">10U</option>
+                            <option value="12u">12U</option>
+                            <option value="14u">14U</option>
+                            <option value="16u">16U / High School</option>
+                            <option value="college">College / Advanced</option>
+                        </select>
+                    </label>
+                </div>
+            </div>
+        </section>
+
+        <!-- Progress Section -->
+        <section id="progress-section" class="card hidden">
+            <h2>Analyzing Swing...</h2>
+            <div class="progress-bar-container">
+                <div id="progress-bar" class="progress-bar"></div>
+            </div>
+            <p id="progress-text" class="progress-text">Extracting video frames...</p>
+        </section>
+
+        <!-- Results Section -->
+        <section id="results-section" class="hidden">
+            <!-- Overall Score -->
+            <div class="card score-card">
+                <h2>Swing Score</h2>
+                <div class="score-display">
+                    <div id="overall-score" class="score-circle">
+                        <span class="score-number">--</span>
+                        <span class="score-label">/ 100</span>
+                    </div>
+                    <div id="score-summary" class="score-summary"></div>
+                </div>
+            </div>
+
+            <!-- Phase Breakdown -->
+            <div class="card">
+                <h2>Swing Phase Breakdown</h2>
+                <div id="phase-timeline" class="phase-timeline"></div>
+                <div id="phase-frames" class="phase-frames"></div>
+            </div>
+
+            <!-- Detailed Metrics -->
+            <div class="card">
+                <h2>Detailed Metrics</h2>
+                <div id="metrics-grid" class="metrics-grid"></div>
+            </div>
+
+            <!-- Frame-by-Frame View -->
+            <div class="card">
+                <h2>Key Frames</h2>
+                <div id="frame-viewer" class="frame-viewer">
+                    <canvas id="frame-canvas"></canvas>
+                    <div id="frame-controls" class="frame-controls">
+                        <button id="prev-frame" class="btn btn-small">&larr; Previous</button>
+                        <span id="frame-label" class="frame-label">Frame 1 / 1</span>
+                        <button id="next-frame" class="btn btn-small">Next &rarr;</button>
+                    </div>
+                    <div id="frame-annotations" class="frame-annotations"></div>
+                </div>
+            </div>
+
+            <!-- Coaching Tips -->
+            <div class="card">
+                <h2>Coaching Recommendations</h2>
+                <div id="coaching-tips" class="coaching-tips"></div>
+            </div>
+
+            <!-- Drill Suggestions -->
+            <div class="card">
+                <h2>Suggested Drills</h2>
+                <div id="drill-suggestions" class="drill-suggestions"></div>
+            </div>
+
+            <div class="controls-row">
+                <button id="new-analysis-btn" class="btn btn-primary">Analyze Another Swing</button>
+            </div>
+        </section>
+    </main>
+
+    <footer>
+        <p>Softball Swing Analyzer &mdash; Helping players improve one swing at a time</p>
+    </footer>
+
+    <script src="analysis-engine.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
