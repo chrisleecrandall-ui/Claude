@@ -9,6 +9,7 @@
 const SwingAnalyzer = (() => {
 
     // ---- Swing Phase Definitions ----
+    // Contact phase name is overridden at runtime based on swing outcome
     const PHASES = [
         { id: 'stance',  name: 'Stance / Setup',   color: '#6366f1' },
         { id: 'load',    name: 'Load / Coil',      color: '#8b5cf6' },
@@ -17,6 +18,14 @@ const SwingAnalyzer = (() => {
         { id: 'contact', name: 'Contact',            color: '#ec4899' },
         { id: 'follow',  name: 'Follow-Through',     color: '#f43f5e' },
     ];
+
+    // Swing outcome types
+    const OUTCOMES = {
+        hit:  { label: 'Hit',          contactPhase: 'Contact' },
+        miss: { label: 'Swing & Miss', contactPhase: 'Swing-Through' },
+        foul: { label: 'Foul Ball',    contactPhase: 'Foul Contact' },
+        ball: { label: 'Ball (Took)',  contactPhase: 'Check Swing / Hold' },
+    };
 
     // ---- Age-group specific ideal metrics ----
     const AGE_BENCHMARKS = {
@@ -179,8 +188,10 @@ const SwingAnalyzer = (() => {
 
     /**
      * Given motion scores per frame, classify each frame into a swing phase.
+     * outcome: 'hit' | 'miss' | 'foul' | 'ball'
+     * For 'ball' (took the pitch), we shorten/skip the swing and contact phases.
      */
-    function detectPhases(motionScores, regionScores) {
+    function detectPhases(motionScores, regionScores, outcome) {
         const n = motionScores.length;
         const phases = new Array(n).fill(0);
 
@@ -204,29 +215,33 @@ const SwingAnalyzer = (() => {
             }
         }
 
-        // Assign phases proportionally
-        // stance: start to motionStart
-        // load: motionStart to partway to peak
-        // stride: mid-section before peak
-        // swing: just before peak
-        // contact: peak area
-        // follow: after peak
+        let loadEnd, strideEnd, swingEnd, contactEnd;
 
-        const loadEnd = motionStart + Math.floor((peakIdx - motionStart) * 0.3);
-        const strideEnd = motionStart + Math.floor((peakIdx - motionStart) * 0.6);
-        const swingEnd = peakIdx;
-        const contactEnd = Math.min(peakIdx + Math.floor((n - peakIdx) * 0.25), n - 1);
+        if (outcome === 'ball') {
+            // Ball taken — there's minimal or no swing
+            // Mostly stance/load, possibly a small stride or check swing
+            loadEnd = motionStart + Math.floor((peakIdx - motionStart) * 0.5);
+            strideEnd = peakIdx;
+            swingEnd = peakIdx;       // No real swing
+            contactEnd = peakIdx;     // No contact
+        } else {
+            // Hit, miss, or foul — full swing happened
+            loadEnd = motionStart + Math.floor((peakIdx - motionStart) * 0.3);
+            strideEnd = motionStart + Math.floor((peakIdx - motionStart) * 0.6);
+            swingEnd = peakIdx;
+            contactEnd = Math.min(peakIdx + Math.floor((n - peakIdx) * 0.25), n - 1);
+        }
 
         for (let i = 0; i < n; i++) {
             if (i < motionStart) phases[i] = 0;        // stance
             else if (i < loadEnd) phases[i] = 1;       // load
             else if (i < strideEnd) phases[i] = 2;     // stride
             else if (i < swingEnd) phases[i] = 3;      // swing
-            else if (i <= contactEnd) phases[i] = 4;    // contact
+            else if (i <= contactEnd) phases[i] = 4;    // contact / swing-through
             else phases[i] = 5;                         // follow-through
         }
 
-        return { phases, peakIdx, motionStart, loadEnd, strideEnd, swingEnd, contactEnd };
+        return { phases, peakIdx, motionStart, loadEnd, strideEnd, swingEnd, contactEnd, outcome };
     }
 
     // ---- Metric Computation ----
@@ -357,8 +372,9 @@ const SwingAnalyzer = (() => {
 
     // ---- Phase Evaluation ----
 
-    function evaluatePhases(frames, motionScores, regionScores, phaseData, metrics) {
+    function evaluatePhases(frames, motionScores, regionScores, phaseData, metrics, config) {
         const { phases, peakIdx, motionStart, loadEnd, strideEnd, swingEnd, contactEnd } = phaseData;
+        const outcome = config.outcome || 'hit';
         const evaluations = [];
 
         // Stance
@@ -406,17 +422,33 @@ const SwingAnalyzer = (() => {
             observations: buildSwingObservations(metrics, swingScore),
         });
 
-        // Contact
-        const contactScore = Math.round(
-            (ratingToNum(metrics.batSpeed.rating) * 0.4 +
-             ratingToNum(metrics.levelSwing.rating) * 0.3 +
-             ratingToNum(metrics.headStability.rating) * 0.3) * 25
-        );
-        evaluations.push({
-            phase: PHASES[4],
-            score: contactScore,
-            observations: buildContactObservations(metrics, contactScore),
-        });
+        // Contact / Swing-Through — adapts based on outcome
+        const outcomeInfo = OUTCOMES[outcome] || OUTCOMES.hit;
+        const contactPhase = { ...PHASES[4], name: outcomeInfo.contactPhase };
+
+        if (outcome === 'ball') {
+            // Ball taken — evaluate discipline instead of contact
+            const disciplineScore = Math.round(
+                (ratingToNum(metrics.headStability.rating) * 0.5 +
+                 ratingToNum(metrics.smoothness.rating) * 0.5) * 25
+            );
+            evaluations.push({
+                phase: contactPhase,
+                score: disciplineScore,
+                observations: buildBallTakenObservations(metrics, disciplineScore),
+            });
+        } else {
+            const contactScore = Math.round(
+                (ratingToNum(metrics.batSpeed.rating) * 0.4 +
+                 ratingToNum(metrics.levelSwing.rating) * 0.3 +
+                 ratingToNum(metrics.headStability.rating) * 0.3) * 25
+            );
+            evaluations.push({
+                phase: contactPhase,
+                score: contactScore,
+                observations: buildContactObservations(metrics, contactScore, outcome),
+            });
+        }
 
         // Follow-through
         const ftScore = Math.round(
@@ -535,7 +567,7 @@ const SwingAnalyzer = (() => {
         return { good, improve };
     }
 
-    function buildContactObservations(metrics, score) {
+    function buildContactObservations(metrics, score, outcome) {
         const good = [];
         const improve = [];
 
@@ -545,11 +577,48 @@ const SwingAnalyzer = (() => {
             improve.push('Head is moving too much — focus on keeping your head still and eyes on the ball');
         }
 
-        if (score >= 70) {
-            good.push('Contact point appears to be out in front with arms extended');
+        if (outcome === 'miss') {
+            improve.push('Swing and miss — the swing mechanics still matter even without contact');
+            improve.push('On a miss, check: were eyes tracking the ball all the way? Was timing early or late?');
+            if (metrics.levelSwing.rating === 'poor' || metrics.levelSwing.rating === 'fair') {
+                improve.push('A more level swing path stays in the hitting zone longer, giving more margin for contact');
+            }
+        } else if (outcome === 'foul') {
+            improve.push('Foul ball — close to making solid contact');
+            if (score >= 60) {
+                good.push('Swing mechanics look reasonable — the timing or pitch location may need adjustment');
+            } else {
+                improve.push('Check if the bat is getting to the contact zone too early (pulling off) or too late');
+            }
         } else {
-            improve.push('Work on contacting the ball out in front of the plate');
-            improve.push('Arms should be extended but not fully locked at contact');
+            // Hit
+            if (score >= 70) {
+                good.push('Contact point appears to be out in front with arms extended');
+            } else {
+                improve.push('Work on contacting the ball out in front of the plate');
+                improve.push('Arms should be extended but not fully locked at contact');
+            }
+        }
+
+        return { good, improve };
+    }
+
+    function buildBallTakenObservations(metrics, score) {
+        const good = [];
+        const improve = [];
+
+        good.push('Good plate discipline — chose not to swing');
+
+        if (metrics.headStability.rating === 'excellent' || metrics.headStability.rating === 'good') {
+            good.push('Head stayed still while tracking the pitch');
+        } else {
+            improve.push('Even when taking a pitch, keep the head still and eyes level to track the ball');
+        }
+
+        if (score >= 60) {
+            good.push('Stayed balanced and in a ready position');
+        } else {
+            improve.push('Work on staying balanced in your stance when taking a pitch — stay ready for the next one');
         }
 
         return { good, improve };
@@ -605,6 +674,7 @@ const SwingAnalyzer = (() => {
 
     function generateCoachingTips(metrics, phaseEvals, config) {
         const tips = [];
+        const outcome = config.outcome || 'hit';
 
         // Identify weakest areas
         const weakMetrics = Object.entries(metrics)
@@ -613,6 +683,30 @@ const SwingAnalyzer = (() => {
 
         const weakPhases = [...phaseEvals]
             .sort((a, b) => a.score - b.score);
+
+        // Outcome-specific tips
+        if (outcome === 'miss') {
+            tips.push({
+                priority: 'high',
+                icon: '👀',
+                title: 'Track the Ball All the Way',
+                detail: 'On a swing and miss, the most common cause is losing sight of the ball. Practice keeping your eye on the ball from the pitcher\'s hand all the way to the bat. A common cue is "see the ball hit the bat." Soft toss and tee work help build this habit.',
+            });
+        } else if (outcome === 'foul') {
+            tips.push({
+                priority: 'medium',
+                icon: '🔧',
+                title: 'Timing Adjustment',
+                detail: 'A foul ball often means the timing or bat angle is slightly off. If fouling to the pull side, you may be early — try waiting a fraction longer. If fouling to the opposite field, you may be late — start the swing a bit earlier.',
+            });
+        } else if (outcome === 'ball') {
+            tips.push({
+                priority: 'low',
+                icon: '👏',
+                title: 'Good Pitch Recognition',
+                detail: 'Taking a ball shows pitch discipline. Continue to develop the ability to recognize ball vs. strike early out of the pitcher\'s hand. This is one of the most valuable skills in softball.',
+            });
+        }
 
         // Hip rotation
         if (metrics.hipRotation.rating === 'poor' || metrics.hipRotation.rating === 'fair') {
@@ -814,11 +908,25 @@ const SwingAnalyzer = (() => {
 
     // ---- Draw Annotations on Frame ----
 
-    function annotateFrame(canvas, frameIdx, phaseData, regionScores, motionScores) {
+    function annotateFrame(canvas, frameIdx, phaseData, regionScores, motionScores, outcome) {
         const ctx = canvas.getContext('2d');
         const w = canvas.width;
         const h = canvas.height;
-        const phase = PHASES[phaseData.phases[frameIdx]];
+        const phaseIdx = phaseData.phases[frameIdx];
+        let phase = PHASES[phaseIdx];
+
+        // Override contact phase name based on outcome
+        if (phaseIdx === 4 && outcome) {
+            const info = OUTCOMES[outcome] || OUTCOMES.hit;
+            phase = { ...phase, name: info.contactPhase };
+        }
+
+        // Scale font sizes relative to video resolution
+        const scale = Math.max(w / 640, 1);
+        const labelFontSize = Math.round(18 * scale);
+        const numberFontSize = Math.round(28 * scale);
+        const smallFontSize = Math.round(12 * scale);
+        const pad = Math.round(10 * scale);
 
         // Draw region grid overlay
         ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
@@ -835,8 +943,8 @@ const SwingAnalyzer = (() => {
         // Draw motion heatmap bars on the right side
         if (regionScores[frameIdx]) {
             const regions = regionScores[frameIdx];
-            const barWidth = 8;
-            const barX = w - barWidth - 10;
+            const barWidth = Math.round(10 * scale);
+            const barX = w - barWidth - pad;
 
             const drawBar = (yStart, yEnd, value) => {
                 const maxH = yEnd - yStart;
@@ -850,23 +958,77 @@ const SwingAnalyzer = (() => {
             drawBar(h * 0.66, h, regions.lower);
         }
 
-        // Draw phase label
+        // ---- Phase number badge (top-left circle) ----
+        const badgeRadius = Math.round(22 * scale);
+        const badgeX = pad + badgeRadius;
+        const badgeY = pad + badgeRadius;
+        ctx.beginPath();
+        ctx.arc(badgeX, badgeY, badgeRadius, 0, Math.PI * 2);
         ctx.fillStyle = phase.color;
-        ctx.fillRect(10, 10, ctx.measureText(phase.name).width + 20, 30);
+        ctx.fill();
+        ctx.strokeStyle = 'white';
+        ctx.lineWidth = 2 * scale;
+        ctx.stroke();
         ctx.fillStyle = 'white';
-        ctx.font = 'bold 14px sans-serif';
-        ctx.fillText(phase.name, 20, 30);
+        ctx.font = `bold ${numberFontSize}px sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(String(phaseIdx + 1), badgeX, badgeY);
 
-        // Draw motion score bar at bottom
-        const motion = motionScores[frameIdx] || 0;
-        const mBarW = Math.min(motion * w * 5, w - 20);
-        ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
-        ctx.fillRect(10, h - 25, w - 20, 15);
+        // ---- Phase name label (next to badge) ----
+        ctx.font = `bold ${labelFontSize}px sans-serif`;
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'top';
+        const labelText = phase.name;
+        const textMetrics = ctx.measureText(labelText);
+        const labelX = badgeX + badgeRadius + pad;
+        const labelY = pad;
+        const labelPadH = Math.round(6 * scale);
+        const labelPadW = Math.round(10 * scale);
+        const labelH = labelFontSize + labelPadH * 2;
+        const labelW = textMetrics.width + labelPadW * 2;
+
+        // Background pill
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.65)';
+        const pillRadius = Math.round(6 * scale);
+        ctx.beginPath();
+        ctx.moveTo(labelX + pillRadius, labelY);
+        ctx.lineTo(labelX + labelW - pillRadius, labelY);
+        ctx.quadraticCurveTo(labelX + labelW, labelY, labelX + labelW, labelY + pillRadius);
+        ctx.lineTo(labelX + labelW, labelY + labelH - pillRadius);
+        ctx.quadraticCurveTo(labelX + labelW, labelY + labelH, labelX + labelW - pillRadius, labelY + labelH);
+        ctx.lineTo(labelX + pillRadius, labelY + labelH);
+        ctx.quadraticCurveTo(labelX, labelY + labelH, labelX, labelY + labelH - pillRadius);
+        ctx.lineTo(labelX, labelY + pillRadius);
+        ctx.quadraticCurveTo(labelX, labelY, labelX + pillRadius, labelY);
+        ctx.closePath();
+        ctx.fill();
+
+        // Colored left accent bar
         ctx.fillStyle = phase.color;
-        ctx.fillRect(10, h - 25, mBarW, 15);
+        ctx.fillRect(labelX, labelY, Math.round(4 * scale), labelH);
+
+        // Text
         ctx.fillStyle = 'white';
-        ctx.font = '11px sans-serif';
-        ctx.fillText('Motion: ' + (motion * 100).toFixed(1), 15, h - 13);
+        ctx.fillText(labelText, labelX + labelPadW, labelY + labelPadH);
+
+        // ---- Motion score bar at bottom ----
+        const motion = motionScores[frameIdx] || 0;
+        const barH = Math.round(20 * scale);
+        const mBarW = Math.min(motion * w * 5, w - pad * 2);
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
+        ctx.fillRect(pad, h - barH - pad, w - pad * 2, barH);
+        ctx.fillStyle = phase.color;
+        ctx.fillRect(pad, h - barH - pad, mBarW, barH);
+        ctx.fillStyle = 'white';
+        ctx.font = `${smallFontSize}px sans-serif`;
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('Motion: ' + (motion * 100).toFixed(1), pad + 5, h - barH / 2 - pad);
+
+        // Reset text alignment
+        ctx.textAlign = 'start';
+        ctx.textBaseline = 'alphabetic';
     }
 
     // ---- Main Analysis Pipeline ----
@@ -898,7 +1060,8 @@ const SwingAnalyzer = (() => {
         onProgress(0.6, 'Detecting swing phases...');
 
         // Step 3: Detect phases
-        const phaseData = detectPhases(motionScores, regionScores);
+        const outcome = config.outcome || 'hit';
+        const phaseData = detectPhases(motionScores, regionScores, outcome);
 
         onProgress(0.7, 'Computing metrics...');
 
@@ -908,7 +1071,7 @@ const SwingAnalyzer = (() => {
         onProgress(0.8, 'Evaluating swing phases...');
 
         // Step 5: Evaluate each phase
-        const phaseEvals = evaluatePhases(frames, motionScores, regionScores, phaseData, metrics);
+        const phaseEvals = evaluatePhases(frames, motionScores, regionScores, phaseData, metrics, config);
 
         onProgress(0.85, 'Generating coaching tips...');
 
@@ -939,7 +1102,7 @@ const SwingAnalyzer = (() => {
             annotCanvas.height = frame.canvas.height;
             const ctx = annotCanvas.getContext('2d');
             ctx.drawImage(frame.canvas, 0, 0);
-            annotateFrame(annotCanvas, idx, phaseData, regionScores, motionScores);
+            annotateFrame(annotCanvas, idx, phaseData, regionScores, motionScores, outcome);
             return {
                 canvas: annotCanvas,
                 time: frame.time,
@@ -968,6 +1131,7 @@ const SwingAnalyzer = (() => {
     return {
         analyze,
         PHASES,
+        OUTCOMES,
     };
 
 })();

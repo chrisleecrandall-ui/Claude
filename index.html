@@ -9,7 +9,7 @@
 <body>
     <header>
         <h1>Softball Swing Analyzer</h1>
-        <p class="subtitle">Upload a video to get detailed swing analysis and coaching tips</p>
+        <p class="subtitle">Upload videos to get detailed swing analysis and coaching tips</p>
     </header>
 
     <main>
@@ -22,11 +22,11 @@
                         <polyline points="17 8 12 3 7 8"/>
                         <line x1="12" y1="3" x2="12" y2="15"/>
                     </svg>
-                    <p class="drop-text">Drag & drop a video here</p>
-                    <p class="drop-subtext">or click to browse</p>
-                    <p class="supported-formats">Supports MP4, MOV, WebM (max 200MB)</p>
+                    <p class="drop-text">Drag & drop video(s) here</p>
+                    <p class="drop-subtext">or click to browse — select one or multiple videos</p>
+                    <p class="supported-formats">Supports MP4, MOV, WebM (max 200MB each)</p>
                 </div>
-                <input type="file" id="video-input" accept="video/*" hidden>
+                <input type="file" id="video-input" accept="video/*" multiple hidden>
             </div>
 
             <div id="video-tips" class="tips-box">
@@ -37,39 +37,24 @@
                     <li>Make sure the <strong>full body</strong> is visible from feet to bat</li>
                     <li>Good lighting helps — outdoor daylight is ideal</li>
                     <li>Record in <strong>slow motion</strong> if your phone supports it</li>
+                    <li>Upload <strong>multiple videos</strong> to compare swings side by side</li>
                 </ul>
             </div>
         </section>
 
-        <!-- Video Preview Section -->
-        <section id="preview-section" class="card hidden">
-            <h2>Video Preview</h2>
-            <div class="video-container">
-                <video id="video-player" controls></video>
-            </div>
-            <div class="controls-row">
-                <button id="analyze-btn" class="btn btn-primary">Analyze Swing</button>
-                <button id="change-video-btn" class="btn btn-secondary">Change Video</button>
-            </div>
-            <div id="analysis-config" class="config-panel">
-                <h3>Analysis Settings</h3>
+        <!-- Video Queue Section -->
+        <section id="queue-section" class="card hidden">
+            <h2>Videos to Analyze</h2>
+            <div id="video-queue" class="video-queue"></div>
+
+            <div id="shared-config" class="config-panel">
+                <h3>Settings (applies to all videos)</h3>
                 <div class="config-grid">
                     <label>
                         <span>Batter Handedness</span>
                         <select id="handedness">
                             <option value="right">Right-Handed</option>
                             <option value="left">Left-Handed</option>
-                        </select>
-                    </label>
-                    <label>
-                        <span>Pitch Type</span>
-                        <select id="pitch-type">
-                            <option value="general">General / Unknown</option>
-                            <option value="fastball">Fastball</option>
-                            <option value="changeup">Changeup</option>
-                            <option value="riseball">Riseball</option>
-                            <option value="dropball">Dropball</option>
-                            <option value="curveball">Curveball</option>
                         </select>
                     </label>
                     <label>
@@ -85,11 +70,17 @@
                     </label>
                 </div>
             </div>
+
+            <div class="controls-row">
+                <button id="analyze-all-btn" class="btn btn-primary">Analyze All Swings</button>
+                <button id="add-more-btn" class="btn btn-secondary">Add More Videos</button>
+                <button id="clear-queue-btn" class="btn btn-secondary">Clear All</button>
+            </div>
         </section>
 
         <!-- Progress Section -->
         <section id="progress-section" class="card hidden">
-            <h2>Analyzing Swing...</h2>
+            <h2 id="progress-title">Analyzing Swing...</h2>
             <div class="progress-bar-container">
                 <div id="progress-bar" class="progress-bar"></div>
             </div>
@@ -98,59 +89,70 @@
 
         <!-- Results Section -->
         <section id="results-section" class="hidden">
-            <!-- Overall Score -->
-            <div class="card score-card">
-                <h2>Swing Score</h2>
-                <div class="score-display">
-                    <div id="overall-score" class="score-circle">
-                        <span class="score-number">--</span>
-                        <span class="score-label">/ 100</span>
+
+            <!-- Comparison bar (only shown when multiple results) -->
+            <div id="comparison-bar" class="card hidden">
+                <h2>Swing Comparison</h2>
+                <div id="comparison-tabs" class="comparison-tabs"></div>
+                <div id="comparison-grid" class="comparison-grid"></div>
+            </div>
+
+            <!-- Single Result Container -->
+            <div id="single-result">
+                <!-- Overall Score -->
+                <div class="card score-card">
+                    <h2 id="result-title">Swing Score</h2>
+                    <div class="score-display">
+                        <div id="overall-score" class="score-circle">
+                            <span class="score-number">--</span>
+                            <span class="score-label">/ 100</span>
+                        </div>
+                        <div id="score-summary" class="score-summary"></div>
                     </div>
-                    <div id="score-summary" class="score-summary"></div>
                 </div>
-            </div>
 
-            <!-- Phase Breakdown -->
-            <div class="card">
-                <h2>Swing Phase Breakdown</h2>
-                <div id="phase-timeline" class="phase-timeline"></div>
-                <div id="phase-frames" class="phase-frames"></div>
-            </div>
+                <!-- Phase Breakdown -->
+                <div class="card">
+                    <h2>Swing Phase Breakdown</h2>
+                    <div id="phase-timeline" class="phase-timeline"></div>
+                    <div id="phase-frames" class="phase-frames"></div>
+                </div>
 
-            <!-- Detailed Metrics -->
-            <div class="card">
-                <h2>Detailed Metrics</h2>
-                <div id="metrics-grid" class="metrics-grid"></div>
-            </div>
+                <!-- Detailed Metrics -->
+                <div class="card">
+                    <h2>Detailed Metrics</h2>
+                    <div id="metrics-grid" class="metrics-grid"></div>
+                </div>
 
-            <!-- Frame-by-Frame View -->
-            <div class="card">
-                <h2>Key Frames</h2>
-                <div id="frame-viewer" class="frame-viewer">
-                    <canvas id="frame-canvas"></canvas>
-                    <div id="frame-controls" class="frame-controls">
-                        <button id="prev-frame" class="btn btn-small">&larr; Previous</button>
-                        <span id="frame-label" class="frame-label">Frame 1 / 1</span>
-                        <button id="next-frame" class="btn btn-small">Next &rarr;</button>
+                <!-- Frame-by-Frame View -->
+                <div class="card">
+                    <h2>Key Frames</h2>
+                    <div id="frame-viewer" class="frame-viewer">
+                        <canvas id="frame-canvas"></canvas>
+                        <div id="frame-controls" class="frame-controls">
+                            <button id="prev-frame" class="btn btn-small">&larr; Previous</button>
+                            <span id="frame-label" class="frame-label">Frame 1 / 1</span>
+                            <button id="next-frame" class="btn btn-small">Next &rarr;</button>
+                        </div>
+                        <div id="frame-annotations" class="frame-annotations"></div>
                     </div>
-                    <div id="frame-annotations" class="frame-annotations"></div>
                 </div>
-            </div>
 
-            <!-- Coaching Tips -->
-            <div class="card">
-                <h2>Coaching Recommendations</h2>
-                <div id="coaching-tips" class="coaching-tips"></div>
-            </div>
+                <!-- Coaching Tips -->
+                <div class="card">
+                    <h2>Coaching Recommendations</h2>
+                    <div id="coaching-tips" class="coaching-tips"></div>
+                </div>
 
-            <!-- Drill Suggestions -->
-            <div class="card">
-                <h2>Suggested Drills</h2>
-                <div id="drill-suggestions" class="drill-suggestions"></div>
+                <!-- Drill Suggestions -->
+                <div class="card">
+                    <h2>Suggested Drills</h2>
+                    <div id="drill-suggestions" class="drill-suggestions"></div>
+                </div>
             </div>
 
             <div class="controls-row">
-                <button id="new-analysis-btn" class="btn btn-primary">Analyze Another Swing</button>
+                <button id="new-analysis-btn" class="btn btn-primary">Analyze More Swings</button>
             </div>
         </section>
     </main>

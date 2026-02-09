@@ -1,8 +1,8 @@
 /**
  * Softball Swing Analyzer — Application Controller
  *
- * Handles UI interactions, video upload, analysis orchestration,
- * and rendering of results.
+ * Handles multi-video upload, per-video outcome tagging,
+ * analysis orchestration, comparison, and result rendering.
  */
 
 (function () {
@@ -11,38 +11,56 @@
     // ---- DOM Elements ----
     const $ = (sel) => document.querySelector(sel);
     const uploadSection = $('#upload-section');
-    const previewSection = $('#preview-section');
+    const queueSection = $('#queue-section');
     const progressSection = $('#progress-section');
     const resultsSection = $('#results-section');
 
     const dropZone = $('#drop-zone');
     const videoInput = $('#video-input');
-    const videoPlayer = $('#video-player');
-    const analyzeBtn = $('#analyze-btn');
-    const changeVideoBtn = $('#change-video-btn');
+    const videoQueue = $('#video-queue');
+    const analyzeAllBtn = $('#analyze-all-btn');
+    const addMoreBtn = $('#add-more-btn');
+    const clearQueueBtn = $('#clear-queue-btn');
     const newAnalysisBtn = $('#new-analysis-btn');
 
+    const progressTitle = $('#progress-title');
     const progressBar = $('#progress-bar');
     const progressText = $('#progress-text');
 
+    const comparisonBar = $('#comparison-bar');
+    const comparisonTabs = $('#comparison-tabs');
+    const comparisonGrid = $('#comparison-grid');
+    const singleResult = $('#single-result');
+
+    const resultTitle = $('#result-title');
     const overallScoreEl = $('#overall-score');
     const scoreSummary = $('#score-summary');
     const phaseTimeline = $('#phase-timeline');
     const phaseFrames = $('#phase-frames');
     const metricsGrid = $('#metrics-grid');
     const frameCanvas = $('#frame-canvas');
-    const frameControls = $('#frame-controls');
     const frameLabel = $('#frame-label');
     const frameAnnotations = $('#frame-annotations');
     const prevFrameBtn = $('#prev-frame');
     const nextFrameBtn = $('#next-frame');
-    const coachingTips = $('#coaching-tips');
-    const drillSuggestions = $('#drill-suggestions');
+    const coachingTipsEl = $('#coaching-tips');
+    const drillSuggestionsEl = $('#drill-suggestions');
 
     // ---- State ----
-    let currentVideoFile = null;
-    let analysisResult = null;
+    let videoFiles = [];       // Array of { file, outcome, id }
+    let allResults = [];       // Array of { name, outcome, result, config }
     let currentFrameIdx = 0;
+    let activeResultIdx = 0;
+    let nextId = 1;
+
+    // ---- Section Management ----
+
+    function showSection(section) {
+        uploadSection.classList.toggle('hidden', section !== 'upload');
+        queueSection.classList.toggle('hidden', section !== 'queue');
+        progressSection.classList.toggle('hidden', section !== 'progress');
+        resultsSection.classList.toggle('hidden', section !== 'results');
+    }
 
     // ---- File Upload ----
 
@@ -60,97 +78,193 @@
     dropZone.addEventListener('drop', (e) => {
         e.preventDefault();
         dropZone.classList.remove('drag-over');
-        const files = e.dataTransfer.files;
+        const files = Array.from(e.dataTransfer.files).filter(f => f.type.startsWith('video/'));
         if (files.length > 0) {
-            handleFile(files[0]);
+            addFiles(files);
         }
     });
 
     videoInput.addEventListener('change', (e) => {
-        if (e.target.files.length > 0) {
-            handleFile(e.target.files[0]);
+        const files = Array.from(e.target.files).filter(f => f.type.startsWith('video/'));
+        if (files.length > 0) {
+            addFiles(files);
         }
+        videoInput.value = '';
     });
 
-    function handleFile(file) {
-        if (!file.type.startsWith('video/')) {
-            alert('Please select a video file.');
-            return;
+    function addFiles(files) {
+        for (const file of files) {
+            if (file.size > 200 * 1024 * 1024) {
+                alert(`"${file.name}" is too large (max 200MB). Skipping.`);
+                continue;
+            }
+            videoFiles.push({
+                file,
+                outcome: 'hit',
+                id: nextId++,
+            });
         }
-
-        if (file.size > 200 * 1024 * 1024) {
-            alert('File is too large. Please select a video under 200MB.');
-            return;
-        }
-
-        currentVideoFile = file;
-        const url = URL.createObjectURL(file);
-        videoPlayer.src = url;
-
-        showSection('preview');
+        renderQueue();
+        showSection('queue');
     }
 
-    // ---- Section Management ----
+    addMoreBtn.addEventListener('click', () => videoInput.click());
 
-    function showSection(section) {
-        uploadSection.classList.toggle('hidden', section !== 'upload');
-        previewSection.classList.toggle('hidden', section !== 'preview');
-        progressSection.classList.toggle('hidden', section !== 'progress');
-        resultsSection.classList.toggle('hidden', section !== 'results');
-    }
-
-    changeVideoBtn.addEventListener('click', () => {
-        videoPlayer.src = '';
-        currentVideoFile = null;
-        videoInput.value = '';
+    clearQueueBtn.addEventListener('click', () => {
+        videoFiles = [];
         showSection('upload');
     });
 
     newAnalysisBtn.addEventListener('click', () => {
-        videoPlayer.src = '';
-        currentVideoFile = null;
-        videoInput.value = '';
-        analysisResult = null;
+        videoFiles = [];
+        allResults = [];
         showSection('upload');
     });
 
-    // ---- Analysis ----
+    // ---- Queue Rendering ----
 
-    analyzeBtn.addEventListener('click', async () => {
-        if (!currentVideoFile) return;
+    function renderQueue() {
+        videoQueue.innerHTML = '';
 
-        showSection('progress');
-        updateProgress(0, 'Loading video...');
+        videoFiles.forEach((entry, idx) => {
+            const item = document.createElement('div');
+            item.className = 'queue-item';
 
-        // Ensure video metadata is loaded
-        await new Promise((resolve) => {
-            if (videoPlayer.readyState >= 1) {
-                resolve();
-            } else {
-                videoPlayer.onloadedmetadata = resolve;
-                videoPlayer.load();
-            }
+            // Thumbnail
+            const thumb = document.createElement('video');
+            thumb.className = 'queue-thumb';
+            thumb.src = URL.createObjectURL(entry.file);
+            thumb.muted = true;
+            thumb.preload = 'metadata';
+            thumb.onloadeddata = () => { thumb.currentTime = 0.5; };
+
+            // Info
+            const info = document.createElement('div');
+            info.className = 'queue-info';
+            const sizeMB = (entry.file.size / (1024 * 1024)).toFixed(1);
+            info.innerHTML = `
+                <div class="queue-name">${entry.file.name}</div>
+                <div class="queue-meta">${sizeMB} MB</div>
+            `;
+
+            // Outcome selector
+            const outcomeWrap = document.createElement('div');
+            outcomeWrap.className = 'queue-outcome';
+            const select = document.createElement('select');
+            select.innerHTML = `
+                <option value="hit">Hit</option>
+                <option value="miss">Swing & Miss</option>
+                <option value="foul">Foul Ball</option>
+                <option value="ball">Ball (Took)</option>
+            `;
+            select.value = entry.outcome;
+            select.addEventListener('change', () => {
+                entry.outcome = select.value;
+            });
+            const label = document.createElement('div');
+            label.style.cssText = 'font-size:0.75rem;color:#6b7280;margin-bottom:2px;';
+            label.textContent = 'Outcome';
+            outcomeWrap.appendChild(label);
+            outcomeWrap.appendChild(select);
+
+            // Remove button
+            const removeBtn = document.createElement('button');
+            removeBtn.className = 'queue-remove';
+            removeBtn.innerHTML = '&times;';
+            removeBtn.title = 'Remove';
+            removeBtn.addEventListener('click', () => {
+                videoFiles.splice(idx, 1);
+                if (videoFiles.length === 0) {
+                    showSection('upload');
+                } else {
+                    renderQueue();
+                }
+            });
+
+            item.appendChild(thumb);
+            item.appendChild(info);
+            item.appendChild(outcomeWrap);
+            item.appendChild(removeBtn);
+            videoQueue.appendChild(item);
         });
 
-        const config = {
+        // Update button text
+        analyzeAllBtn.textContent = videoFiles.length === 1
+            ? 'Analyze Swing'
+            : `Analyze All ${videoFiles.length} Swings`;
+    }
+
+    // ---- Analysis ----
+
+    analyzeAllBtn.addEventListener('click', async () => {
+        if (videoFiles.length === 0) return;
+
+        showSection('progress');
+        allResults = [];
+
+        const sharedConfig = {
             handedness: $('#handedness').value,
-            pitchType: $('#pitch-type').value,
             ageGroup: $('#age-group').value,
         };
 
-        try {
-            analysisResult = await SwingAnalyzer.analyze(
-                videoPlayer,
-                config,
-                updateProgress
-            );
+        for (let i = 0; i < videoFiles.length; i++) {
+            const entry = videoFiles[i];
+            const videoNum = i + 1;
+            const total = videoFiles.length;
 
-            renderResults(analysisResult, config);
+            progressTitle.textContent = total > 1
+                ? `Analyzing Swing ${videoNum} of ${total}...`
+                : 'Analyzing Swing...';
+
+            const config = {
+                ...sharedConfig,
+                outcome: entry.outcome,
+                pitchType: 'general',
+            };
+
+            try {
+                // Create a temporary video element for analysis
+                const videoEl = document.createElement('video');
+                videoEl.src = URL.createObjectURL(entry.file);
+                videoEl.muted = true;
+                videoEl.preload = 'auto';
+
+                await new Promise((resolve, reject) => {
+                    videoEl.onloadedmetadata = resolve;
+                    videoEl.onerror = reject;
+                    videoEl.load();
+                });
+
+                const result = await SwingAnalyzer.analyze(
+                    videoEl,
+                    config,
+                    (fraction, msg) => {
+                        const overallFraction = (i + fraction) / total;
+                        updateProgress(overallFraction, `Video ${videoNum}/${total}: ${msg}`);
+                    }
+                );
+
+                allResults.push({
+                    name: entry.file.name,
+                    outcome: entry.outcome,
+                    result,
+                    config,
+                });
+
+                // Clean up
+                URL.revokeObjectURL(videoEl.src);
+            } catch (err) {
+                console.error(`Error analyzing ${entry.file.name}:`, err);
+                alert(`Error analyzing "${entry.file.name}": ${err.message}`);
+            }
+        }
+
+        if (allResults.length > 0) {
+            activeResultIdx = 0;
+            renderAllResults();
             showSection('results');
-        } catch (err) {
-            console.error('Analysis error:', err);
-            alert('Error analyzing video: ' + err.message);
-            showSection('preview');
+        } else {
+            showSection('queue');
         }
     });
 
@@ -161,7 +275,93 @@
 
     // ---- Render Results ----
 
-    function renderResults(result, config) {
+    function renderAllResults() {
+        if (allResults.length > 1) {
+            renderComparison();
+            comparisonBar.classList.remove('hidden');
+        } else {
+            comparisonBar.classList.add('hidden');
+        }
+
+        renderSingleResult(activeResultIdx);
+    }
+
+    function renderComparison() {
+        // Tabs
+        comparisonTabs.innerHTML = '';
+        allResults.forEach((r, idx) => {
+            const tab = document.createElement('div');
+            tab.className = 'comparison-tab' + (idx === activeResultIdx ? ' active' : '');
+
+            const outcomeLabel = SwingAnalyzer.OUTCOMES[r.outcome]
+                ? SwingAnalyzer.OUTCOMES[r.outcome].label
+                : 'Hit';
+            const scoreColor = r.result.overallScore >= 70 ? '#10b981'
+                : r.result.overallScore >= 50 ? '#3b82f6' : '#f59e0b';
+
+            tab.innerHTML = `Swing ${idx + 1}
+                <span class="tab-score" style="background:${scoreColor}">${r.result.overallScore}</span>`;
+            tab.title = `${r.name} — ${outcomeLabel}`;
+
+            tab.addEventListener('click', () => {
+                activeResultIdx = idx;
+                renderAllResults();
+            });
+            comparisonTabs.appendChild(tab);
+        });
+
+        // Comparison grid — show key metrics across all videos
+        comparisonGrid.innerHTML = '';
+        const metricKeys = ['batSpeed', 'swingTime', 'hipRotation', 'smoothness', 'levelSwing', 'headStability'];
+
+        metricKeys.forEach(key => {
+            const div = document.createElement('div');
+            div.className = 'comparison-metric';
+
+            const firstMetric = allResults[0].result.metrics[key];
+            if (!firstMetric) return;
+
+            // Find the best value
+            let bestIdx = 0;
+            let bestRating = 0;
+            allResults.forEach((r, idx) => {
+                const rating = ratingToNum(r.result.metrics[key].rating);
+                if (rating > bestRating) {
+                    bestRating = rating;
+                    bestIdx = idx;
+                }
+            });
+
+            let valuesHtml = allResults.map((r, idx) => {
+                const m = r.result.metrics[key];
+                const isBest = idx === bestIdx && allResults.length > 1;
+                return `<span class="cm-value${isBest ? ' best' : ''}">#${idx + 1}: ${m.value}</span>`;
+            }).join('');
+
+            div.innerHTML = `
+                <div class="cm-label">${firstMetric.name}</div>
+                <div class="cm-values">${valuesHtml}</div>
+            `;
+            comparisonGrid.appendChild(div);
+        });
+    }
+
+    function ratingToNum(rating) {
+        return { excellent: 4, good: 3, fair: 2, poor: 1 }[rating] || 2;
+    }
+
+    function renderSingleResult(idx) {
+        const { name, outcome, result, config } = allResults[idx];
+        const outcomeLabel = SwingAnalyzer.OUTCOMES[outcome]
+            ? SwingAnalyzer.OUTCOMES[outcome].label
+            : 'Hit';
+
+        if (allResults.length > 1) {
+            resultTitle.textContent = `Swing ${idx + 1}: ${name} (${outcomeLabel})`;
+        } else {
+            resultTitle.textContent = `Swing Score (${outcomeLabel})`;
+        }
+
         renderOverallScore(result.overallScore);
         renderPhaseTimeline(result.phaseEvals);
         renderMetrics(result.metrics);
@@ -175,7 +375,6 @@
         const scoreNum = overallScoreEl.querySelector('.score-number');
         scoreNum.textContent = score;
 
-        // Color based on score
         overallScoreEl.className = 'score-circle';
         if (score >= 80) overallScoreEl.classList.add('score-excellent');
         else if (score >= 60) overallScoreEl.classList.add('score-good');
@@ -206,7 +405,6 @@
         phaseFrames.innerHTML = '';
 
         phaseEvals.forEach((eval_, idx) => {
-            // Timeline segment
             const seg = document.createElement('div');
             seg.className = `phase-segment phase-${eval_.phase.id}`;
             seg.textContent = eval_.phase.name;
@@ -214,7 +412,6 @@
             phaseTimeline.appendChild(seg);
         });
 
-        // Show first phase by default
         if (phaseEvals.length > 0) {
             showPhaseDetail(0, phaseEvals);
         }
@@ -222,12 +419,9 @@
 
     function showPhaseDetail(idx, phaseEvals) {
         const eval_ = phaseEvals[idx];
-
-        // Update active state
         const segments = phaseTimeline.querySelectorAll('.phase-segment');
         segments.forEach((s, i) => s.classList.toggle('active', i === idx));
 
-        // Build detail view
         const scoreColor = eval_.score >= 70 ? '#10b981' : eval_.score >= 50 ? '#f59e0b' : '#ef4444';
 
         let html = `<div class="phase-detail">`;
@@ -314,10 +508,10 @@
 
     // -- Coaching Tips --
     function renderCoachingTips(tips) {
-        coachingTips.innerHTML = '';
+        coachingTipsEl.innerHTML = '';
 
         if (tips.length === 0) {
-            coachingTips.innerHTML = '<p>Great swing! No major areas for improvement detected.</p>';
+            coachingTipsEl.innerHTML = '<p>Great swing! No major areas for improvement detected.</p>';
             return;
         }
 
@@ -331,13 +525,13 @@
                     <p>${tip.detail}</p>
                 </div>
             `;
-            coachingTips.appendChild(div);
+            coachingTipsEl.appendChild(div);
         });
     }
 
     // -- Drills --
     function renderDrills(drills) {
-        drillSuggestions.innerHTML = '';
+        drillSuggestionsEl.innerHTML = '';
 
         drills.forEach(drill => {
             const div = document.createElement('div');
@@ -348,7 +542,7 @@
                 <p class="drill-purpose">${drill.purpose}</p>
                 <ol class="drill-steps">${stepsHtml}</ol>
             `;
-            drillSuggestions.appendChild(div);
+            drillSuggestionsEl.appendChild(div);
         });
     }
 
