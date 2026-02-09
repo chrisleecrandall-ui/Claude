@@ -64,7 +64,11 @@
 
     // ---- File Upload ----
 
-    dropZone.addEventListener('click', () => videoInput.click());
+    dropZone.addEventListener('click', (e) => {
+        // Prevent re-triggering when the input's click bubbles back up
+        if (e.target === videoInput) return;
+        videoInput.click();
+    });
 
     dropZone.addEventListener('dragover', (e) => {
         e.preventDefault();
@@ -78,19 +82,26 @@
     dropZone.addEventListener('drop', (e) => {
         e.preventDefault();
         dropZone.classList.remove('drag-over');
-        const files = Array.from(e.dataTransfer.files).filter(f => f.type.startsWith('video/'));
+        const files = Array.from(e.dataTransfer.files).filter(isVideoFile);
         if (files.length > 0) {
             addFiles(files);
         }
     });
 
     videoInput.addEventListener('change', (e) => {
-        const files = Array.from(e.target.files).filter(f => f.type.startsWith('video/'));
+        const files = Array.from(e.target.files).filter(isVideoFile);
         if (files.length > 0) {
             addFiles(files);
         }
         videoInput.value = '';
     });
+
+    function isVideoFile(file) {
+        if (file.type.startsWith('video/')) return true;
+        // Fallback: check extension for files where MIME type is missing (common on mobile)
+        const ext = file.name.split('.').pop().toLowerCase();
+        return ['mp4', 'mov', 'webm', 'avi', 'm4v', 'mkv'].includes(ext);
+    }
 
     function addFiles(files) {
         for (const file of files) {
