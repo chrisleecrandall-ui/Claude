@@ -4,6 +4,8 @@
  * Designed for real-world game footage (GameChanger-style behind-home-plate videos).
  * Scans full at-bat videos to find individual pitch/swing events, isolates the
  * batter zone, and analyzes swing mechanics for each detected swing.
+ *
+ * Handles: title card detection & skip, tight batter zone, multi-pitch at-bats.
  */
 
 const SwingAnalyzer = (() => {
@@ -45,21 +47,12 @@ const SwingAnalyzer = (() => {
 
     // ---- Filename Parsing ----
 
-    /**
-     * Parse GameChanger-style filenames for outcome and context.
-     * Examples:
-     *   "Batter Out, Runners Advance @ TN Fury Platinum Johnson 18U.MP4"
-     *   "Home Run @ Lady Bulldogs 14U.mp4"
-     *   "Strikeout Looking @ Some Team.MOV"
-     */
     function parseFilename(filename) {
-        const name = filename.replace(/\.[^.]+$/, ''); // strip extension
-        const lower = name.toLowerCase();
+        const name = filename.replace(/\.[^.]+$/, '');
 
-        let outcome = 'hit'; // default
+        let outcome = 'hit';
         let description = name;
 
-        // Match common GameChanger outcome patterns
         const outcomePatterns = [
             { pattern: /home\s*run/i,                outcome: 'homerun' },
             { pattern: /triple/i,                    outcome: 'triple' },
@@ -83,7 +76,6 @@ const SwingAnalyzer = (() => {
             }
         }
 
-        // Try to extract opponent team name (after @ symbol)
         const atMatch = name.match(/@\s*(.+)/);
         const opponent = atMatch ? atMatch[1].trim() : null;
 
@@ -92,9 +84,6 @@ const SwingAnalyzer = (() => {
 
     // ---- Frame Extraction ----
 
-    /**
-     * Extract a single frame at a given time from a video element.
-     */
     function extractFrameAt(videoEl, time) {
         return new Promise((resolve, reject) => {
             videoEl.currentTime = time;
@@ -110,9 +99,71 @@ const SwingAnalyzer = (() => {
         });
     }
 
+    // ---- Brightness / Title Card Detection ----
+
     /**
-     * Quick-scan the video at regular intervals to build a motion timeline.
-     * Returns array of { time, motion, batterMotion } for each sample point.
+     * Compute average brightness of a canvas (0-1 scale).
+     * GameChanger title cards have dark backgrounds (~0.05-0.15).
+     * Gameplay frames are much brighter (~0.3-0.7 for outdoor fields).
+     */
+    function computeBrightness(canvas) {
+        const ctx = canvas.getContext('2d');
+        const w = canvas.width;
+        const h = canvas.height;
+        const data = ctx.getImageData(0, 0, w, h).data;
+
+        let sum = 0;
+        let count = 0;
+        const step = 32; // sample every 32nd pixel for speed
+
+        for (let i = 0; i < data.length; i += 4 * step) {
+            sum += data[i] + data[i + 1] + data[i + 2];
+            count++;
+        }
+
+        return sum / (count * 3 * 255);
+    }
+
+    /**
+     * Detect where the GameChanger title card ends.
+     * Returns the index into the samples array where gameplay begins.
+     *
+     * Strategy: Title cards are dark (brightness < 0.25). Gameplay is bright.
+     * We look for the transition from dark to bright frames.
+     * Also handles videos with no title card (returns 0).
+     */
+    function detectTitleCardEnd(samples) {
+        if (samples.length < 3) return 0;
+
+        // Check if early frames are dark (title card)
+        const earlyCount = Math.min(8, Math.floor(samples.length * 0.3));
+        const earlyBrightness = samples.slice(0, earlyCount).map(s => s.brightness);
+        const avgEarlyBrightness = earlyBrightness.reduce((a, b) => a + b, 0) / earlyBrightness.length;
+
+        // If early frames are already bright, there's no title card
+        if (avgEarlyBrightness > 0.25) return 0;
+
+        // Find the first frame where brightness jumps above the threshold
+        // indicating the transition from title card to gameplay
+        const brightnessThreshold = 0.25;
+
+        for (let i = 0; i < samples.length; i++) {
+            if (samples[i].brightness > brightnessThreshold) {
+                // Found the transition — skip a couple extra frames to clear
+                // any transition animation/fade
+                return Math.min(i + 2, samples.length - 1);
+            }
+        }
+
+        // If the whole video is dark, just start from the beginning
+        return 0;
+    }
+
+    // ---- Motion Scanning ----
+
+    /**
+     * Quick-scan the video at regular intervals to build a motion + brightness timeline.
+     * Returns array of { time, motion, batterMotion, brightness, canvas }
      */
     async function scanVideoMotion(videoEl, sampleInterval, onProgress) {
         const duration = videoEl.duration;
@@ -122,17 +173,17 @@ const SwingAnalyzer = (() => {
 
         const samples = [];
         const times = [];
-        const start = 0.5; // skip first half-second
-        const end = Math.max(duration - 0.5, start + 1);
+        const start = 0.3;
+        const end = Math.max(duration - 0.3, start + 1);
 
         for (let t = start; t <= end; t += sampleInterval) {
             times.push(t);
         }
 
-        // Extract all sample frames
         let prevCanvas = null;
         for (let i = 0; i < times.length; i++) {
             const frame = await extractFrameAt(videoEl, times[i]);
+            const brightness = computeBrightness(frame.canvas);
 
             if (prevCanvas) {
                 const fullMotion = motionBetween(prevCanvas, frame.canvas);
@@ -141,6 +192,7 @@ const SwingAnalyzer = (() => {
                     time: times[i],
                     motion: fullMotion,
                     batterMotion: batterMotion,
+                    brightness: brightness,
                     canvas: frame.canvas,
                 });
             } else {
@@ -148,6 +200,7 @@ const SwingAnalyzer = (() => {
                     time: times[i],
                     motion: 0,
                     batterMotion: 0,
+                    brightness: brightness,
                     canvas: frame.canvas,
                 });
             }
@@ -164,20 +217,25 @@ const SwingAnalyzer = (() => {
     // ---- Batter Zone Detection ----
 
     /**
-     * For behind-home-plate view, the batter is in the lower-center area.
-     * We define a "batter zone" covering the area where the batter stands.
-     * Returns motion score for just the batter region.
+     * For behind-home-plate GameChanger view, the batter is in the
+     * lower-center of the frame, near home plate.
+     *
+     * Tight batter zone:
+     *   - Width:  25% to 65% of frame (the batter's box area)
+     *   - Height: 50% to 92% of frame (bottom portion where batter stands)
+     *
+     * This is much tighter than before to avoid picking up fielders,
+     * the pitcher, or the title card text area.
      */
     function batterZoneMotion(canvasA, canvasB) {
         const w = canvasA.width;
         const h = canvasA.height;
 
-        // Batter zone: lower 60% of frame height, center 50% of width
-        // This captures the batter from both sides of the plate
-        const zoneX = Math.floor(w * 0.15);
-        const zoneW = Math.floor(w * 0.70);
-        const zoneY = Math.floor(h * 0.30);
-        const zoneH = Math.floor(h * 0.60);
+        // Tight batter zone for behind-plate view
+        const zoneX = Math.floor(w * 0.25);
+        const zoneW = Math.floor(w * 0.40); // 25% to 65%
+        const zoneY = Math.floor(h * 0.50);
+        const zoneH = Math.floor(h * 0.42); // 50% to 92%
 
         const ctxA = canvasA.getContext('2d');
         const ctxB = canvasB.getContext('2d');
@@ -197,6 +255,7 @@ const SwingAnalyzer = (() => {
 
     /**
      * Compute motion in sub-regions of the batter zone (left/right/upper/lower).
+     * Uses the same tight batter zone coordinates.
      */
     function batterRegionMotion(canvasA, canvasB) {
         const w = canvasA.width;
@@ -204,13 +263,12 @@ const SwingAnalyzer = (() => {
         const ctxA = canvasA.getContext('2d');
         const ctxB = canvasB.getContext('2d');
 
-        // Batter zone bounds
-        const zX = Math.floor(w * 0.15);
-        const zW = Math.floor(w * 0.70);
-        const zY = Math.floor(h * 0.30);
-        const zH = Math.floor(h * 0.60);
+        // Same tight batter zone
+        const zX = Math.floor(w * 0.25);
+        const zW = Math.floor(w * 0.40);
+        const zY = Math.floor(h * 0.50);
+        const zH = Math.floor(h * 0.42);
 
-        // Split into quadrants within batter zone
         const regions = {
             upper: { x: zX, y: zY, w: zW, h: Math.floor(zH * 0.45) },
             lower: { x: zX, y: zY + Math.floor(zH * 0.45), w: zW, h: zH - Math.floor(zH * 0.45) },
@@ -239,37 +297,52 @@ const SwingAnalyzer = (() => {
 
     /**
      * Detect individual swing/pitch events from the motion timeline.
+     * Only searches within gameplay frames (after title card).
+     *
      * A swing event is a sharp spike in batter-zone motion.
      * Returns array of { peakTime, startTime, endTime, peakMotion, sampleIndices }
      */
-    function detectSwingEvents(samples, minGapSeconds) {
-        if (samples.length < 3) return [];
+    function detectSwingEvents(samples, minGapSeconds, gameplayStartIdx) {
+        // Only look at gameplay frames
+        const gameplay = samples.slice(gameplayStartIdx);
+        if (gameplay.length < 3) return [];
 
-        // Use batter-zone motion to find peaks
-        const motions = samples.map(s => s.batterMotion);
+        const motions = gameplay.map(s => s.batterMotion);
 
         // Compute adaptive threshold: mean + 1.5 * stddev of batter motion
         const mean = motions.reduce((a, b) => a + b, 0) / motions.length;
         const variance = motions.reduce((a, b) => a + (b - mean) ** 2, 0) / motions.length;
         const stddev = Math.sqrt(variance);
-        const threshold = Math.max(mean + 1.5 * stddev, mean * 2, 0.015);
+        const threshold = Math.max(mean + 1.5 * stddev, mean * 2, 0.012);
 
         // Find peaks above threshold
         const peaks = [];
         for (let i = 1; i < motions.length - 1; i++) {
             if (motions[i] > threshold && motions[i] >= motions[i - 1] && motions[i] >= motions[i + 1]) {
-                peaks.push({ idx: i, motion: motions[i], time: samples[i].time });
+                peaks.push({
+                    idx: i + gameplayStartIdx, // map back to original index
+                    motion: motions[i],
+                    time: gameplay[i].time,
+                });
             }
         }
 
-        // Also check if any point is above threshold even if not a local max
-        // (handles plateaus)
+        // Also check for above-threshold even if not a local max (plateaus)
         if (peaks.length === 0) {
+            let maxI = 0;
+            let maxM = 0;
             for (let i = 0; i < motions.length; i++) {
-                if (motions[i] > threshold) {
-                    peaks.push({ idx: i, motion: motions[i], time: samples[i].time });
-                    break; // Just grab the first one
+                if (motions[i] > maxM) {
+                    maxM = motions[i];
+                    maxI = i;
                 }
+            }
+            if (maxM > 0) {
+                peaks.push({
+                    idx: maxI + gameplayStartIdx,
+                    motion: maxM,
+                    time: gameplay[maxI].time,
+                });
             }
         }
 
@@ -279,7 +352,6 @@ const SwingAnalyzer = (() => {
             if (merged.length > 0) {
                 const last = merged[merged.length - 1];
                 if (peak.time - last.time < minGapSeconds) {
-                    // Part of the same event — keep the bigger one
                     if (peak.motion > last.motion) {
                         merged[merged.length - 1] = peak;
                     }
@@ -289,12 +361,11 @@ const SwingAnalyzer = (() => {
             merged.push(peak);
         }
 
-        // Build swing events with context frames
+        // Build swing events with context window
         const events = merged.map(peak => {
-            // Find the window around this peak: ~1s before, ~1s after
-            const windowBefore = 1.0;
-            const windowAfter = 1.0;
-            const startTime = Math.max(peak.time - windowBefore, samples[0].time);
+            const windowBefore = 1.2;
+            const windowAfter = 1.2;
+            const startTime = Math.max(peak.time - windowBefore, samples[gameplayStartIdx].time);
             const endTime = Math.min(peak.time + windowAfter, samples[samples.length - 1].time);
 
             const sampleIndices = [];
@@ -414,11 +485,9 @@ const SwingAnalyzer = (() => {
         const swingFrames = Math.max(peakIdx - motionStart, 1);
         const swingTime = swingFrames * frameDuration;
 
-        // Bat speed: max batter-zone motion (upper region = bat area)
         const upperMotions = regionScores.map(r => r.upper || 0);
         const maxBatSpeed = Math.max(...upperMotions);
 
-        // Hip rotation: lower region motion during swing
         const hipMotions = regionScores
             .map((r, i) => phases[i] === 3 ? (r.lower || 0) : 0)
             .filter(v => v > 0);
@@ -426,14 +495,12 @@ const SwingAnalyzer = (() => {
             ? hipMotions.reduce((a, b) => a + b, 0) / hipMotions.length
             : 0;
 
-        // Weight transfer: left-right shift
         const leftMotions = regionScores.map(r => r.left || 0);
         const rightMotions = regionScores.map(r => r.right || 0);
         const leftTotal = leftMotions.reduce((a, b) => a + b, 0);
         const rightTotal = rightMotions.reduce((a, b) => a + b, 0);
         const weightTransfer = Math.abs(leftTotal - rightTotal) / Math.max(leftTotal + rightTotal, 0.001);
 
-        // Smoothness
         const swingMotions = motionScores.slice(motionStart, peakIdx + 1);
         const meanSwing = swingMotions.length > 0
             ? swingMotions.reduce((a, b) => a + b, 0) / swingMotions.length
@@ -445,7 +512,6 @@ const SwingAnalyzer = (() => {
             ? 1 - Math.min(Math.sqrt(swingVariance) / meanSwing, 1)
             : 0.5;
 
-        // Level swing: compare upper vs lower motion during swing
         const swingUpperAvg = regionScores
             .slice(motionStart, peakIdx + 1)
             .reduce((a, r) => a + (r.upper || 0), 0) / swingFrames;
@@ -454,10 +520,8 @@ const SwingAnalyzer = (() => {
             .reduce((a, r) => a + (r.lower || 0), 0) / swingFrames;
         const levelSwing = 1 - Math.abs(swingUpperAvg - swingLowerAvg) / Math.max(swingUpperAvg, swingLowerAvg, 0.001);
 
-        // Head stability: less upper motion = more stable
         const headStability = Math.max(0, 1 - (swingUpperAvg * 2));
 
-        // Follow-through
         const followMotions = motionScores.slice(peakIdx + 1);
         const followThrough = followMotions.length > 0
             ? followMotions.reduce((a, b) => a + b, 0) / followMotions.length
@@ -547,7 +611,6 @@ const SwingAnalyzer = (() => {
         const isNoSwing = outcome === 'ball' || outcome === 'walk';
         const evaluations = [];
 
-        // Stance
         const stanceMotions = motionScores.slice(0, Math.max(motionStart, 1));
         const stanceStill = stanceMotions.reduce((a, b) => a + b, 0) / Math.max(stanceMotions.length, 1);
         const stanceScore = Math.round(Math.max(0, (1 - stanceStill * 20)) * 100);
@@ -557,7 +620,6 @@ const SwingAnalyzer = (() => {
             observations: buildStanceObs(stanceStill, stanceScore),
         });
 
-        // Load
         const loadRegions = regionScores.slice(motionStart, Math.max(loadEnd, motionStart + 1));
         const loadUpperAvg = loadRegions.reduce((a, r) => a + (r.upper || 0), 0) / Math.max(loadRegions.length, 1);
         const loadScore = Math.round(Math.min(100, 40 + loadUpperAvg * 800));
@@ -567,7 +629,6 @@ const SwingAnalyzer = (() => {
             observations: buildLoadObs(loadUpperAvg, loadScore),
         });
 
-        // Stride
         const strideRegions = regionScores.slice(loadEnd, Math.max(strideEnd, loadEnd + 1));
         const strideLowerAvg = strideRegions.reduce((a, r) => a + (r.lower || 0), 0) / Math.max(strideRegions.length, 1);
         const strideScore = Math.round(Math.min(100, 40 + strideLowerAvg * 600));
@@ -577,7 +638,6 @@ const SwingAnalyzer = (() => {
             observations: buildStrideObs(strideLowerAvg, strideScore),
         });
 
-        // Swing
         const swingScore = Math.round(
             (ratingToNum(metrics.batSpeed.rating) * 0.3 +
              ratingToNum(metrics.smoothness.rating) * 0.3 +
@@ -589,7 +649,6 @@ const SwingAnalyzer = (() => {
             observations: buildSwingObs(metrics, swingScore),
         });
 
-        // Contact
         const outcomeInfo = OUTCOMES[outcome] || OUTCOMES.hit;
         const contactPhase = { ...PHASES[4], name: outcomeInfo.contactPhase };
 
@@ -616,7 +675,6 @@ const SwingAnalyzer = (() => {
             });
         }
 
-        // Follow-through
         const ftScore = Math.round(
             (ratingToNum(metrics.followThrough.rating) * 0.5 +
              ratingToNum(metrics.hipRotation.rating) * 0.5) * 25
@@ -630,7 +688,7 @@ const SwingAnalyzer = (() => {
         return evaluations;
     }
 
-    // ---- Observation Builders (compact) ----
+    // ---- Observation Builders ----
 
     function buildStanceObs(stillness, score) {
         const good = [], improve = [];
@@ -702,7 +760,6 @@ const SwingAnalyzer = (() => {
             if (score >= 60) good.push('Made contact — check pitch selection and placement');
             else improve.push('Work on making harder contact');
         } else {
-            // hit, homerun, single, double, triple, error
             if (score >= 70) good.push('Solid contact out front with arms extended');
             else improve.push('Work on contacting the ball out in front');
         }
@@ -817,18 +874,18 @@ const SwingAnalyzer = (() => {
         const smallFontSize = Math.round(12 * scale);
         const pad = Math.round(10 * scale);
 
-        // Batter zone outline
-        const zoneX = Math.floor(w * 0.15);
-        const zoneW = Math.floor(w * 0.70);
-        const zoneY = Math.floor(h * 0.30);
-        const zoneH = Math.floor(h * 0.60);
-        ctx.strokeStyle = 'rgba(255, 255, 0, 0.4)';
+        // Draw the tight batter zone outline
+        const zoneX = Math.floor(w * 0.25);
+        const zoneW = Math.floor(w * 0.40);
+        const zoneY = Math.floor(h * 0.50);
+        const zoneH = Math.floor(h * 0.42);
+        ctx.strokeStyle = 'rgba(255, 255, 0, 0.5)';
         ctx.lineWidth = 2;
         ctx.setLineDash([8, 4]);
         ctx.strokeRect(zoneX, zoneY, zoneW, zoneH);
         ctx.setLineDash([]);
 
-        // Phase badge
+        // Phase badge (numbered circle)
         const badgeR = Math.round(22 * scale);
         const bx = pad + badgeR;
         const by = pad + badgeR;
@@ -875,7 +932,7 @@ const SwingAnalyzer = (() => {
             ctx.fillText(pitchLabel, w - pad - lPad, pad + lPad + smallFontSize * 0.8);
         }
 
-        // Motion bar
+        // Motion bar at bottom
         const barH = Math.round(20 * scale);
         const mBarW = Math.min(motionScore * w * 5, w - pad * 2);
         ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
@@ -898,39 +955,47 @@ const SwingAnalyzer = (() => {
         onProgress(0, 'Scanning video for swing events...');
 
         const duration = videoEl.duration;
-        // Determine scan rate based on video length
-        // Short videos (<5s) = high detail, long videos = coarser scan
         const sampleInterval = duration > 10 ? 0.3 : 0.15;
 
-        // Step 1: Scan the entire video for motion
+        // Step 1: Scan the entire video for motion + brightness
         const samples = await scanVideoMotion(videoEl, sampleInterval, (p) => {
             onProgress(p * 0.3, 'Scanning video for swing events...');
         });
 
-        onProgress(0.3, 'Detecting pitch events...');
+        onProgress(0.3, 'Detecting title card...');
 
-        // Step 2: Find swing/pitch events
-        const minGapBetweenPitches = 2.0; // seconds
-        const events = detectSwingEvents(samples, minGapBetweenPitches);
+        // Step 2: Detect and skip GameChanger title card
+        const gameplayStartIdx = detectTitleCardEnd(samples);
+        const gameplayStartTime = samples[gameplayStartIdx] ? samples[gameplayStartIdx].time : 0;
+
+        onProgress(0.32, gameplayStartIdx > 0
+            ? `Skipped title card (${gameplayStartTime.toFixed(1)}s). Detecting pitch events...`
+            : 'No title card detected. Detecting pitch events...');
+
+        // Step 3: Find swing/pitch events (only in gameplay frames)
+        const minGapBetweenPitches = 2.0;
+        const events = detectSwingEvents(samples, minGapBetweenPitches, gameplayStartIdx);
 
         if (events.length === 0) {
-            // Fallback: if no clear events found, analyze the whole video as one swing
-            // Use the highest-motion portion
-            const sorted = [...samples].sort((a, b) => b.batterMotion - a.batterMotion);
-            const peakTime = sorted[0].time;
-            events.push({
-                peakTime,
-                peakMotion: sorted[0].batterMotion,
-                startTime: Math.max(peakTime - 1.5, 0),
-                endTime: Math.min(peakTime + 1.5, duration),
-                peakIdx: samples.indexOf(sorted[0]),
-                sampleIndices: [],
-            });
+            // Fallback: use the highest-motion gameplay frame
+            const gameplay = samples.slice(gameplayStartIdx);
+            if (gameplay.length > 0) {
+                const sorted = [...gameplay].sort((a, b) => b.batterMotion - a.batterMotion);
+                const peakTime = sorted[0].time;
+                events.push({
+                    peakTime,
+                    peakMotion: sorted[0].batterMotion,
+                    startTime: Math.max(peakTime - 1.5, gameplayStartTime),
+                    endTime: Math.min(peakTime + 1.5, duration),
+                    peakIdx: samples.indexOf(sorted[0]),
+                    sampleIndices: [],
+                });
+            }
         }
 
         onProgress(0.35, `Found ${events.length} pitch event(s). Analyzing...`);
 
-        // Step 3: Analyze each swing event
+        // Step 4: Analyze each swing event
         const pitchResults = [];
 
         for (let e = 0; e < events.length; e++) {
@@ -941,10 +1006,8 @@ const SwingAnalyzer = (() => {
 
             onProgress(pctBase, `Analyzing pitch ${pitchNum} of ${events.length}...`);
 
-            // Extract detailed frames around this swing event
             const frames = await extractSwingFrames(videoEl, event, 16);
 
-            // Compute batter-zone motion between consecutive frames
             const motionScores = [0];
             const regionScores = [{ upper: 0, lower: 0, left: 0, right: 0 }];
 
@@ -953,8 +1016,6 @@ const SwingAnalyzer = (() => {
                 regionScores.push(batterRegionMotion(frames[i - 1].canvas, frames[i].canvas));
             }
 
-            // Determine outcome for this specific pitch
-            // Last event gets the at-bat outcome; earlier events are intermediate pitches
             const isLastPitch = (e === events.length - 1);
             const pitchOutcome = isLastPitch ? (config.outcome || 'hit') : 'ball';
 
@@ -968,7 +1029,6 @@ const SwingAnalyzer = (() => {
                 : [];
             const drills = isLastPitch ? generateDrills(metrics, phaseEvals, config) : [];
 
-            // Annotate key frames
             const keyIndices = [
                 0,
                 phaseData.motionStart,
@@ -977,7 +1037,6 @@ const SwingAnalyzer = (() => {
                 Math.min(phaseData.peakIdx, frames.length - 1),
                 Math.min(phaseData.contactEnd + 1, frames.length - 1),
             ];
-            // Deduplicate
             const uniqueIndices = [...new Set(keyIndices)].sort((a, b) => a - b);
 
             const outcomeInfo = OUTCOMES[pitchOutcome] || OUTCOMES.hit;
@@ -1028,7 +1087,6 @@ const SwingAnalyzer = (() => {
 
         onProgress(0.95, 'Finalizing...');
 
-        // The "main" result is the last pitch (the at-bat outcome)
         const mainResult = pitchResults[pitchResults.length - 1];
 
         onProgress(1.0, 'Analysis complete!');
@@ -1044,9 +1102,10 @@ const SwingAnalyzer = (() => {
             regionScores: mainResult.regionScores,
             phaseData: mainResult.phaseData,
             frames: mainResult.frames,
-            // Multi-pitch data
             pitchResults,
             pitchCount: pitchResults.length,
+            gameplayStartTime,
+            titleCardSkipped: gameplayStartIdx > 0,
         };
     }
 
