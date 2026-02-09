@@ -2,7 +2,8 @@
  * Softball Swing Analyzer — Application Controller
  *
  * Handles multi-video upload, per-video outcome tagging (auto-detected from filename),
- * analysis orchestration, comparison, multi-pitch navigation, and result rendering.
+ * manual swing marking, analysis orchestration, comparison, multi-pitch navigation,
+ * and result rendering.
  */
 
 (function () {
@@ -18,6 +19,12 @@
     const dropZone = $('#drop-zone');
     const videoInput = $('#video-input');
     const videoQueue = $('#video-queue');
+    const swingMarkerPanel = $('#swing-marker-panel');
+    const markerVideo = $('#marker-video');
+    const markerTimeDisplay = $('#marker-time');
+    const markSwingBtn = $('#mark-swing-btn');
+    const markerList = $('#marker-list');
+    const markerDoneBtn = $('#marker-done-btn');
     const analyzeAllBtn = $('#analyze-all-btn');
     const addMoreBtn = $('#add-more-btn');
     const clearQueueBtn = $('#clear-queue-btn');
@@ -64,12 +71,13 @@
     ];
 
     // ---- State ----
-    let videoFiles = [];       // Array of { file, outcome, autoDetected, id }
+    let videoFiles = [];       // Array of { file, outcome, autoDetected, swingTimes, id, ... }
     let allResults = [];       // Array of { name, outcome, result, config }
     let currentFrameIdx = 0;
     let activeResultIdx = 0;
-    let activePitchIdx = -1;   // -1 means "main result" (last pitch); 0+ = specific pitch
+    let activePitchIdx = -1;
     let nextId = 1;
+    let activeMarkerEntryIdx = -1; // which queue entry is being marked
 
     // ---- Section Management ----
 
@@ -126,7 +134,6 @@
                 continue;
             }
 
-            // Auto-detect outcome from filename
             const parsed = SwingAnalyzer.parseFilename(file.name);
 
             videoFiles.push({
@@ -135,6 +142,7 @@
                 autoDetected: true,
                 opponent: parsed.opponent,
                 description: parsed.description,
+                swingTimes: [],  // manually marked swing timestamps
                 id: nextId++,
             });
         }
@@ -146,6 +154,7 @@
 
     clearQueueBtn.addEventListener('click', () => {
         videoFiles = [];
+        closeSwingMarker();
         showSection('upload');
     });
 
@@ -201,6 +210,11 @@
                 infoHtml += ` <span class="auto-detected">(auto-detected)</span>`;
             }
             infoHtml += `</div>`;
+
+            // Show swing marker status
+            if (entry.swingTimes.length > 0) {
+                infoHtml += `<div class="queue-swings-marked">${entry.swingTimes.length} swing(s) marked</div>`;
+            }
             info.innerHTML = infoHtml;
 
             // Outcome selector
@@ -213,6 +227,16 @@
             outcomeWrap.appendChild(label);
             outcomeWrap.appendChild(select);
 
+            // Mark Swing button
+            const markBtn = document.createElement('button');
+            markBtn.className = 'btn-mark-swing';
+            markBtn.textContent = entry.swingTimes.length > 0 ? 'Edit Marks' : 'Mark Swing';
+            markBtn.title = 'Open video to mark swing moment(s)';
+            markBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                openSwingMarker(idx);
+            });
+
             // Remove button
             const removeBtn = document.createElement('button');
             removeBtn.className = 'queue-remove';
@@ -220,6 +244,7 @@
             removeBtn.title = 'Remove';
             removeBtn.addEventListener('click', () => {
                 videoFiles.splice(idx, 1);
+                if (activeMarkerEntryIdx === idx) closeSwingMarker();
                 if (videoFiles.length === 0) {
                     showSection('upload');
                 } else {
@@ -230,6 +255,7 @@
             item.appendChild(thumb);
             item.appendChild(info);
             item.appendChild(outcomeWrap);
+            item.appendChild(markBtn);
             item.appendChild(removeBtn);
             videoQueue.appendChild(item);
         });
@@ -239,11 +265,113 @@
             : `Analyze All ${videoFiles.length} Swings`;
     }
 
+    // ---- Swing Marker ----
+
+    function openSwingMarker(entryIdx) {
+        const entry = videoFiles[entryIdx];
+        activeMarkerEntryIdx = entryIdx;
+
+        // Set up video
+        markerVideo.src = URL.createObjectURL(entry.file);
+        markerVideo.load();
+
+        // Show panel
+        swingMarkerPanel.classList.remove('hidden');
+
+        // Update time display as video plays
+        markerVideo.ontimeupdate = () => {
+            markerTimeDisplay.textContent = formatTime(markerVideo.currentTime) +
+                ' / ' + formatTime(markerVideo.duration || 0);
+        };
+
+        // Render existing marks
+        renderMarkerList(entry);
+    }
+
+    function closeSwingMarker() {
+        activeMarkerEntryIdx = -1;
+        markerVideo.pause();
+        markerVideo.src = '';
+        swingMarkerPanel.classList.add('hidden');
+    }
+
+    function formatTime(seconds) {
+        if (!seconds || isNaN(seconds)) return '0:00.0';
+        const mins = Math.floor(seconds / 60);
+        const secs = seconds % 60;
+        return mins + ':' + secs.toFixed(1).padStart(4, '0');
+    }
+
+    // Mark Swing button
+    markSwingBtn.addEventListener('click', () => {
+        if (activeMarkerEntryIdx < 0) return;
+        const entry = videoFiles[activeMarkerEntryIdx];
+        const time = markerVideo.currentTime;
+
+        // Don't add duplicates within 0.5s
+        const isDuplicate = entry.swingTimes.some(t => Math.abs(t - time) < 0.5);
+        if (isDuplicate) return;
+
+        entry.swingTimes.push(time);
+        entry.swingTimes.sort((a, b) => a - b);
+        renderMarkerList(entry);
+        renderQueue(); // update badge in queue
+    });
+
+    // Done button
+    markerDoneBtn.addEventListener('click', () => {
+        closeSwingMarker();
+    });
+
+    function renderMarkerList(entry) {
+        markerList.innerHTML = '';
+
+        if (entry.swingTimes.length === 0) {
+            markerList.innerHTML = '<p class="marker-hint">No swings marked yet. Play the video, pause on the swing, and click "Mark Swing Here".</p>';
+            return;
+        }
+
+        entry.swingTimes.forEach((time, i) => {
+            const item = document.createElement('div');
+            item.className = 'marker-item';
+
+            const label = document.createElement('span');
+            label.className = 'marker-time-label';
+            label.textContent = `Swing ${i + 1} at ${formatTime(time)}`;
+
+            // Jump to this time
+            const jumpBtn = document.createElement('button');
+            jumpBtn.className = 'marker-jump';
+            jumpBtn.textContent = 'Go';
+            jumpBtn.title = 'Jump to this time';
+            jumpBtn.addEventListener('click', () => {
+                markerVideo.currentTime = time;
+            });
+
+            // Remove mark
+            const removeBtn = document.createElement('button');
+            removeBtn.className = 'marker-remove';
+            removeBtn.innerHTML = '&times;';
+            removeBtn.title = 'Remove this mark';
+            removeBtn.addEventListener('click', () => {
+                entry.swingTimes.splice(i, 1);
+                renderMarkerList(entry);
+                renderQueue();
+            });
+
+            item.appendChild(label);
+            item.appendChild(jumpBtn);
+            item.appendChild(removeBtn);
+            markerList.appendChild(item);
+        });
+    }
+
     // ---- Analysis ----
 
     analyzeAllBtn.addEventListener('click', async () => {
         if (videoFiles.length === 0) return;
 
+        closeSwingMarker();
         showSection('progress');
         allResults = [];
 
@@ -265,6 +393,7 @@
                 ...sharedConfig,
                 outcome: entry.outcome,
                 pitchType: 'general',
+                manualSwingTimes: entry.swingTimes.length > 0 ? entry.swingTimes : null,
             };
 
             try {
@@ -399,7 +528,6 @@
             ? SwingAnalyzer.OUTCOMES[outcome].label
             : 'Hit';
 
-        // Title
         let title = '';
         if (allResults.length > 1) {
             title = `Swing ${idx + 1}: ${outcomeLabel}`;
@@ -409,10 +537,8 @@
         if (opponent) title += ` vs ${opponent}`;
         resultTitle.textContent = title;
 
-        // Pitch tabs (if multiple pitches)
         renderPitchTabs(result);
 
-        // Show the active pitch data
         const pitchData = getActivePitchData(result);
         renderOverallScore(pitchData.overallScore);
         renderPhaseTimeline(pitchData.phaseEvals);
@@ -426,7 +552,6 @@
         if (activePitchIdx >= 0 && result.pitchResults && result.pitchResults[activePitchIdx]) {
             return result.pitchResults[activePitchIdx];
         }
-        // Default: return the main result (last pitch)
         return result;
     }
 
@@ -441,7 +566,6 @@
         pitchTabsContainer.classList.remove('hidden');
         pitchTabsContainer.innerHTML = '';
 
-        // "Summary" tab (last pitch / at-bat result)
         const summaryTab = document.createElement('div');
         summaryTab.className = 'pitch-tab' + (activePitchIdx === -1 ? ' active' : '');
         summaryTab.innerHTML = `At-Bat Result <span class="pitch-tab-score">${result.overallScore}</span>`;
@@ -451,7 +575,6 @@
         });
         pitchTabsContainer.appendChild(summaryTab);
 
-        // Individual pitch tabs
         result.pitchResults.forEach((pitch, i) => {
             const tab = document.createElement('div');
             tab.className = 'pitch-tab' + (activePitchIdx === i ? ' active' : '');

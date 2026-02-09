@@ -982,54 +982,75 @@ const SwingAnalyzer = (() => {
     // ---- Main Analysis Pipeline ----
 
     async function analyze(videoEl, config, onProgress) {
-        onProgress(0, 'Scanning video for swing events...');
-
         const duration = videoEl.duration;
-        const sampleInterval = duration > 10 ? 0.3 : 0.15;
+        const manualTimes = config.manualSwingTimes;
+        let events = [];
+        let gameplayStartTime = 0;
 
-        // Step 1: Scan the entire video for motion + brightness
-        const samples = await scanVideoMotion(videoEl, sampleInterval, (p) => {
-            onProgress(p * 0.3, 'Scanning video for swing events...');
-        });
+        if (manualTimes && manualTimes.length > 0) {
+            // ---- MANUAL MODE: User marked swing timestamps ----
+            // Skip the entire scanning / title-card / auto-detection pipeline.
+            // Build events directly from the user-provided timestamps.
+            onProgress(0.05, `Using ${manualTimes.length} manually marked swing(s)...`);
 
-        onProgress(0.3, 'Detecting title card...');
+            events = manualTimes.map(time => ({
+                peakTime: time,
+                peakMotion: 1,
+                startTime: Math.max(time - 0.8, 0),
+                endTime: Math.min(time + 1.0, duration),
+                peakIdx: 0,
+                sampleIndices: [],
+            }));
 
-        // Step 2: Detect and skip GameChanger title card
-        const gameplayStartIdx = detectTitleCardEnd(samples);
-        const gameplayStartTime = samples[gameplayStartIdx] ? samples[gameplayStartIdx].time : 0;
+            onProgress(0.35, `${events.length} swing(s) ready. Analyzing...`);
+        } else {
+            // ---- AUTO MODE: Scan video for swing events ----
+            onProgress(0, 'Scanning video for swing events...');
 
-        onProgress(0.32, gameplayStartIdx > 0
-            ? `Skipped title card (${gameplayStartTime.toFixed(1)}s). Detecting pitch events...`
-            : 'No title card detected. Detecting pitch events...');
+            const sampleInterval = duration > 10 ? 0.3 : 0.15;
 
-        // Step 3: Find swing/pitch events (only in gameplay frames)
-        const minGapBetweenPitches = 3.0;
-        const events = detectSwingEvents(samples, minGapBetweenPitches, gameplayStartIdx);
+            // Step 1: Scan the entire video for motion + brightness
+            const samples = await scanVideoMotion(videoEl, sampleInterval, (p) => {
+                onProgress(p * 0.3, 'Scanning video for swing events...');
+            });
 
-        if (events.length === 0) {
-            // Fallback: find the first frame with above-average motion
-            // and center a short window around it (onset-based, not peak-based)
-            const gameplay = samples.slice(gameplayStartIdx);
-            if (gameplay.length > 0) {
-                const motions = gameplay.map(s => s.batterMotion);
-                const avgMotion = motions.reduce((a, b) => a + b, 0) / motions.length;
-                let onsetIdx = 0;
-                for (let i = 0; i < motions.length; i++) {
-                    if (motions[i] > avgMotion) { onsetIdx = i; break; }
+            onProgress(0.3, 'Detecting title card...');
+
+            // Step 2: Detect and skip GameChanger title card
+            const gameplayStartIdx = detectTitleCardEnd(samples);
+            gameplayStartTime = samples[gameplayStartIdx] ? samples[gameplayStartIdx].time : 0;
+
+            onProgress(0.32, gameplayStartIdx > 0
+                ? `Skipped title card (${gameplayStartTime.toFixed(1)}s). Detecting pitch events...`
+                : 'No title card detected. Detecting pitch events...');
+
+            // Step 3: Find swing/pitch events (only in gameplay frames)
+            const minGapBetweenPitches = 3.0;
+            events = detectSwingEvents(samples, minGapBetweenPitches, gameplayStartIdx);
+
+            if (events.length === 0) {
+                const gameplay = samples.slice(gameplayStartIdx);
+                if (gameplay.length > 0) {
+                    const motions = gameplay.map(s => s.batterMotion);
+                    const avgMotion = motions.reduce((a, b) => a + b, 0) / motions.length;
+                    let onsetIdx = 0;
+                    for (let i = 0; i < motions.length; i++) {
+                        if (motions[i] > avgMotion) { onsetIdx = i; break; }
+                    }
+                    const onsetTime = gameplay[onsetIdx].time;
+                    events.push({
+                        peakTime: onsetTime,
+                        peakMotion: gameplay[onsetIdx].batterMotion,
+                        startTime: Math.max(onsetTime - 0.6, gameplayStartTime),
+                        endTime: Math.min(onsetTime + 1.0, duration),
+                        peakIdx: onsetIdx + gameplayStartIdx,
+                        sampleIndices: [],
+                    });
                 }
-                const onsetTime = gameplay[onsetIdx].time;
-                events.push({
-                    peakTime: onsetTime,
-                    peakMotion: gameplay[onsetIdx].batterMotion,
-                    startTime: Math.max(onsetTime - 0.6, gameplayStartTime),
-                    endTime: Math.min(onsetTime + 1.0, duration),
-                    peakIdx: onsetIdx + gameplayStartIdx,
-                    sampleIndices: [],
-                });
             }
-        }
 
-        onProgress(0.35, `Found ${events.length} pitch event(s). Analyzing...`);
+            onProgress(0.35, `Found ${events.length} pitch event(s). Analyzing...`);
+        }
 
         // Step 4: Analyze each swing event
         const pitchResults = [];

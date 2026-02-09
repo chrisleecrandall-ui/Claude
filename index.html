@@ -32,12 +32,11 @@
             <div id="video-tips" class="tips-box">
                 <h3>Tips for best results:</h3>
                 <ul>
-                    <li>Film from the <strong>side view</strong> (third-base side for right-handed batters)</li>
-                    <li>Keep the camera <strong>steady</strong> — use a tripod if possible</li>
-                    <li>Make sure the <strong>full body</strong> is visible from feet to bat</li>
-                    <li>Good lighting helps — outdoor daylight is ideal</li>
-                    <li>Record in <strong>slow motion</strong> if your phone supports it</li>
+                    <li>Works with <strong>GameChanger</strong> videos (behind home plate) and side-view clips</li>
+                    <li>After uploading, click <strong>"Mark Swing"</strong> to pinpoint the exact swing moment in each video</li>
                     <li>Upload <strong>multiple videos</strong> to compare swings side by side</li>
+                    <li>The <strong>filename</strong> is used to auto-detect the outcome (hit, out, strikeout, etc.)</li>
+                    <li>Good lighting helps — outdoor daylight is ideal</li>
                 </ul>
             </div>
         </section>
@@ -75,6 +74,23 @@
                 <button id="analyze-all-btn" class="btn btn-primary">Analyze All Swings</button>
                 <button id="add-more-btn" class="btn btn-secondary">Add More Videos</button>
                 <button id="clear-queue-btn" class="btn btn-secondary">Clear All</button>
+            </div>
+
+            <!-- Swing Marker Panel -->
+            <div id="swing-marker-panel" class="swing-marker-panel hidden">
+                <h3>Mark Swing Moment(s)</h3>
+                <p class="marker-instructions">Play the video and pause right when the batter swings. Then click "Mark Swing Here". You can mark multiple swings if the at-bat has multiple pitches.</p>
+                <div class="marker-video-wrap">
+                    <video id="marker-video" controls playsinline></video>
+                </div>
+                <div class="marker-controls">
+                    <span id="marker-time" class="marker-time">0:00.0 / 0:00.0</span>
+                    <button id="mark-swing-btn" class="btn btn-primary btn-mark">Mark Swing Here</button>
+                </div>
+                <div id="marker-list" class="marker-list">
+                    <p class="marker-hint">No swings marked yet. Play the video, pause on the swing, and click "Mark Swing Here".</p>
+                </div>
+                <button id="marker-done-btn" class="btn btn-secondary">Done Marking</button>
             </div>
         </section>
 
