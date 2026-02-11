@@ -986,6 +986,7 @@ const SwingAnalyzer = (() => {
         const manualTimes = config.manualSwingTimes;
         let events = [];
         let gameplayStartTime = 0;
+        let gameplayStartIdx = 0;
 
         if (manualTimes && manualTimes.length > 0) {
             // ---- MANUAL MODE: User marked swing timestamps ----
@@ -1017,7 +1018,7 @@ const SwingAnalyzer = (() => {
             onProgress(0.3, 'Detecting title card...');
 
             // Step 2: Detect and skip GameChanger title card
-            const gameplayStartIdx = detectTitleCardEnd(samples);
+            gameplayStartIdx = detectTitleCardEnd(samples);
             gameplayStartTime = samples[gameplayStartIdx] ? samples[gameplayStartIdx].time : 0;
 
             onProgress(0.32, gameplayStartIdx > 0
