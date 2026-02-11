@@ -26,9 +26,16 @@
     const markerList = $('#marker-list');
     const markerDoneBtn = $('#marker-done-btn');
     const analyzeAllBtn = $('#analyze-all-btn');
+    const diagnoseBtn = $('#diagnose-btn');
     const addMoreBtn = $('#add-more-btn');
     const clearQueueBtn = $('#clear-queue-btn');
     const newAnalysisBtn = $('#new-analysis-btn');
+
+    const diagnosticSection = $('#diagnostic-section');
+    const diagCloseBtn = $('#diag-close-btn');
+    const diagInfo = $('#diag-info');
+    const diagChart = $('#diag-chart');
+    const diagThumbs = $('#diag-thumbs');
 
     const progressTitle = $('#progress-title');
     const progressBar = $('#progress-bar');
@@ -772,6 +779,84 @@
             `;
             drillSuggestionsEl.appendChild(div);
         });
+    }
+
+    // ---- Diagnostic Mode ----
+
+    diagnoseBtn.addEventListener('click', async () => {
+        if (videoFiles.length === 0) return;
+
+        // Use the first video in queue for diagnostics
+        const entry = videoFiles[0];
+
+        closeSwingMarker();
+        showSection('progress');
+        progressTitle.textContent = 'Running Diagnostic Scan...';
+
+        try {
+            const videoEl = document.createElement('video');
+            videoEl.src = URL.createObjectURL(entry.file);
+            videoEl.muted = true;
+            videoEl.preload = 'auto';
+
+            await new Promise((resolve, reject) => {
+                videoEl.onloadedmetadata = resolve;
+                videoEl.onerror = reject;
+                videoEl.load();
+            });
+
+            const diagResult = await SwingAnalyzer.diagnose(
+                videoEl,
+                (fraction, msg) => {
+                    updateProgress(fraction, msg);
+                }
+            );
+
+            URL.revokeObjectURL(videoEl.src);
+            renderDiagnostic(entry, diagResult);
+        } catch (err) {
+            console.error('Diagnostic error:', err);
+            alert('Diagnostic error: ' + err.message);
+            showSection('queue');
+        }
+    });
+
+    diagCloseBtn.addEventListener('click', () => {
+        diagnosticSection.classList.add('hidden');
+        showSection('queue');
+    });
+
+    function renderDiagnostic(entry, diagResult) {
+        // Hide other sections, show diagnostic
+        uploadSection.classList.add('hidden');
+        queueSection.classList.add('hidden');
+        progressSection.classList.add('hidden');
+        resultsSection.classList.add('hidden');
+        diagnosticSection.classList.remove('hidden');
+
+        const vi = diagResult.videoInfo;
+        const evts = diagResult.events;
+
+        let infoText = `File: ${entry.file.name}\n`;
+        infoText += `Video: ${vi.width}x${vi.height}, ${vi.duration.toFixed(1)}s duration\n`;
+        infoText += `Samples: ${vi.sampleCount} frames at ${vi.sampleInterval}s intervals\n`;
+        infoText += `Title card: ${diagResult.titleCardSkipped ? 'Detected (skipped ' + diagResult.gameplayStartTime.toFixed(1) + 's)' : 'None detected'}\n`;
+        infoText += `Swing events found: ${evts.length}`;
+        if (evts.length > 0) {
+            infoText += ' — at ' + evts.map(e => e.peakTime.toFixed(1) + 's').join(', ');
+        }
+        diagInfo.textContent = infoText;
+        diagInfo.style.whiteSpace = 'pre-line';
+
+        // Motion chart
+        diagChart.innerHTML = '';
+        diagChart.appendChild(diagResult.chartCanvas);
+
+        // Frame thumbnails
+        diagThumbs.innerHTML = '';
+        for (const thumb of diagResult.thumbnails) {
+            diagThumbs.appendChild(thumb.canvas);
+        }
     }
 
 })();

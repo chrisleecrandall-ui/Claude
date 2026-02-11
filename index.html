@@ -72,6 +72,7 @@
 
             <div class="controls-row">
                 <button id="analyze-all-btn" class="btn btn-primary">Analyze All Swings</button>
+                <button id="diagnose-btn" class="btn btn-secondary">Diagnose Detection</button>
                 <button id="add-more-btn" class="btn btn-secondary">Add More Videos</button>
                 <button id="clear-queue-btn" class="btn btn-secondary">Clear All</button>
             </div>
@@ -92,6 +93,19 @@
                 </div>
                 <button id="marker-done-btn" class="btn btn-secondary">Done Marking</button>
             </div>
+        </section>
+
+        <!-- Diagnostic Section -->
+        <section id="diagnostic-section" class="card hidden">
+            <div class="diag-header">
+                <h2>Detection Diagnostic</h2>
+                <button id="diag-close-btn" class="btn btn-secondary btn-small">Close</button>
+            </div>
+            <p class="diag-info" id="diag-info"></p>
+            <h3>Motion Timeline</h3>
+            <div id="diag-chart" class="diag-chart"></div>
+            <h3>Sampled Frames <span class="diag-hint">(yellow box = batter zone, green border = detected swing, red = title card)</span></h3>
+            <div id="diag-thumbs" class="diag-thumbs"></div>
         </section>
 
         <!-- Progress Section -->

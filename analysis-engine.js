@@ -1167,9 +1167,260 @@ const SwingAnalyzer = (() => {
         };
     }
 
+    // ---- Diagnostic Mode ----
+
+    /**
+     * Diagnostic scan: runs the same scanning pipeline as analyze() but returns
+     * raw visual data — frame thumbnails with batter zone overlays, motion scores,
+     * brightness values, title card detection, and detected swing events.
+     *
+     * The caller renders this as a visual dashboard the user can screenshot.
+     */
+    async function diagnose(videoEl, onProgress) {
+        const duration = videoEl.duration;
+        if (!duration || duration === Infinity) {
+            throw new Error('Cannot determine video duration');
+        }
+
+        onProgress(0, 'Scanning video frames...');
+
+        // Sample more densely for diagnostic view
+        const sampleInterval = duration > 15 ? 0.5 : 0.25;
+
+        const samples = await scanVideoMotion(videoEl, sampleInterval, (p) => {
+            onProgress(p * 0.7, 'Scanning video frames...');
+        });
+
+        onProgress(0.7, 'Detecting title card...');
+
+        const gameplayStartIdx = detectTitleCardEnd(samples);
+        const gameplayStartTime = samples[gameplayStartIdx] ? samples[gameplayStartIdx].time : 0;
+
+        onProgress(0.75, 'Detecting swing events...');
+
+        const events = detectSwingEvents(samples, 3.0, gameplayStartIdx);
+
+        onProgress(0.8, 'Building diagnostic thumbnails...');
+
+        // Build annotated thumbnails showing the batter zone
+        const thumbSize = 240; // thumbnail width
+        const thumbnails = [];
+
+        for (let i = 0; i < samples.length; i++) {
+            const s = samples[i];
+            const srcCanvas = s.canvas;
+            const srcW = srcCanvas.width;
+            const srcH = srcCanvas.height;
+            const scale = thumbSize / srcW;
+            const thumbH = Math.round(srcH * scale);
+
+            const tc = document.createElement('canvas');
+            tc.width = thumbSize;
+            tc.height = thumbH;
+            const ctx = tc.getContext('2d');
+
+            // Draw scaled frame
+            ctx.drawImage(srcCanvas, 0, 0, thumbSize, thumbH);
+
+            // Draw batter zone rectangle (yellow dashed)
+            const zoneX = Math.floor(thumbSize * 0.25);
+            const zoneW = Math.floor(thumbSize * 0.40);
+            const zoneY = Math.floor(thumbH * 0.50);
+            const zoneH = Math.floor(thumbH * 0.42);
+
+            ctx.strokeStyle = '#facc15';
+            ctx.lineWidth = 2;
+            ctx.setLineDash([6, 4]);
+            ctx.strokeRect(zoneX, zoneY, zoneW, zoneH);
+            ctx.setLineDash([]);
+
+            // Label: time + motion score
+            const isTitle = i < gameplayStartIdx;
+            const fontSize = 11;
+            ctx.font = `bold ${fontSize}px sans-serif`;
+
+            // Background bar at top
+            ctx.fillStyle = isTitle ? 'rgba(220, 38, 38, 0.8)' : 'rgba(0, 0, 0, 0.7)';
+            ctx.fillRect(0, 0, thumbSize, fontSize + 8);
+
+            ctx.fillStyle = 'white';
+            ctx.textBaseline = 'top';
+            const label = `${s.time.toFixed(1)}s | M:${(s.batterMotion * 100).toFixed(1)} | B:${s.brightness.toFixed(2)}`;
+            ctx.fillText(label, 4, 3);
+
+            // If this sample is within a detected event window, mark it
+            const inEvent = events.some(e => s.time >= e.startTime && s.time <= e.endTime);
+            if (inEvent) {
+                ctx.strokeStyle = '#22c55e';
+                ctx.lineWidth = 3;
+                ctx.setLineDash([]);
+                ctx.strokeRect(1, 1, thumbSize - 2, thumbH - 2);
+
+                ctx.fillStyle = '#22c55e';
+                ctx.font = `bold ${fontSize}px sans-serif`;
+                ctx.fillText('SWING', thumbSize - 50, thumbH - fontSize - 4);
+            }
+
+            // Mark title card frames
+            if (isTitle) {
+                ctx.fillStyle = 'rgba(220, 38, 38, 0.3)';
+                ctx.fillRect(0, 0, thumbSize, thumbH);
+                ctx.fillStyle = '#fca5a5';
+                ctx.font = `bold ${fontSize}px sans-serif`;
+                ctx.fillText('TITLE CARD', 4, thumbH - fontSize - 4);
+            }
+
+            thumbnails.push({
+                canvas: tc,
+                time: s.time,
+                motion: s.batterMotion,
+                brightness: s.brightness,
+                isTitle,
+                inEvent,
+            });
+        }
+
+        onProgress(0.95, 'Building motion chart...');
+
+        // Build motion timeline as a canvas chart
+        const chartW = Math.max(800, samples.length * 12);
+        const chartH = 200;
+        const chartCanvas = document.createElement('canvas');
+        chartCanvas.width = chartW;
+        chartCanvas.height = chartH;
+        const cctx = chartCanvas.getContext('2d');
+
+        // Background
+        cctx.fillStyle = '#1e1e2e';
+        cctx.fillRect(0, 0, chartW, chartH);
+
+        // Find max motion for scaling
+        const maxMotion = Math.max(...samples.map(s => s.batterMotion), 0.01);
+
+        const barW = Math.max(4, Math.floor((chartW - 60) / samples.length) - 1);
+        const chartLeft = 50;
+        const chartTop = 20;
+        const chartBottom = chartH - 30;
+        const chartRange = chartBottom - chartTop;
+
+        // Draw Y axis labels
+        cctx.fillStyle = '#94a3b8';
+        cctx.font = '10px monospace';
+        cctx.textAlign = 'right';
+        cctx.textBaseline = 'middle';
+        for (let v = 0; v <= 1; v += 0.25) {
+            const y = chartBottom - v * chartRange;
+            const label = (v * maxMotion * 100).toFixed(1);
+            cctx.fillText(label, chartLeft - 4, y);
+            cctx.strokeStyle = '#334155';
+            cctx.lineWidth = 0.5;
+            cctx.beginPath();
+            cctx.moveTo(chartLeft, y);
+            cctx.lineTo(chartW, y);
+            cctx.stroke();
+        }
+
+        // Draw bars
+        for (let i = 0; i < samples.length; i++) {
+            const s = samples[i];
+            const x = chartLeft + i * (barW + 1);
+            const barH = (s.batterMotion / maxMotion) * chartRange;
+
+            // Color based on state
+            if (i < gameplayStartIdx) {
+                cctx.fillStyle = '#ef4444'; // title card = red
+            } else if (events.some(e => s.time >= e.startTime && s.time <= e.endTime)) {
+                cctx.fillStyle = '#22c55e'; // in swing event = green
+            } else {
+                cctx.fillStyle = '#3b82f6'; // gameplay = blue
+            }
+
+            cctx.fillRect(x, chartBottom - barH, barW, barH);
+
+            // Time label every 10th bar
+            if (i % 10 === 0 || i === samples.length - 1) {
+                cctx.fillStyle = '#94a3b8';
+                cctx.font = '9px monospace';
+                cctx.textAlign = 'center';
+                cctx.fillText(s.time.toFixed(1) + 's', x + barW / 2, chartH - 5);
+            }
+        }
+
+        // Mark event onset times with vertical lines
+        cctx.strokeStyle = '#facc15';
+        cctx.lineWidth = 2;
+        cctx.setLineDash([4, 3]);
+        for (const e of events) {
+            const idx = samples.findIndex(s => Math.abs(s.time - e.peakTime) < sampleInterval);
+            if (idx >= 0) {
+                const x = chartLeft + idx * (barW + 1) + barW / 2;
+                cctx.beginPath();
+                cctx.moveTo(x, chartTop);
+                cctx.lineTo(x, chartBottom);
+                cctx.stroke();
+
+                cctx.fillStyle = '#facc15';
+                cctx.font = 'bold 10px sans-serif';
+                cctx.textAlign = 'center';
+                cctx.setLineDash([]);
+                cctx.fillText('ONSET', x, chartTop - 4);
+                cctx.setLineDash([4, 3]);
+            }
+        }
+
+        // Legend
+        cctx.setLineDash([]);
+        cctx.font = '10px sans-serif';
+        cctx.textAlign = 'left';
+        const legendY = 10;
+        const legendItems = [
+            { color: '#ef4444', label: 'Title Card' },
+            { color: '#3b82f6', label: 'Gameplay' },
+            { color: '#22c55e', label: 'Detected Swing' },
+            { color: '#facc15', label: 'Onset' },
+        ];
+        let lx = chartLeft;
+        for (const item of legendItems) {
+            cctx.fillStyle = item.color;
+            cctx.fillRect(lx, legendY - 5, 10, 10);
+            cctx.fillStyle = '#e2e8f0';
+            cctx.fillText(item.label, lx + 14, legendY + 3);
+            lx += cctx.measureText(item.label).width + 30;
+        }
+
+        onProgress(1.0, 'Diagnostic complete!');
+
+        return {
+            thumbnails,
+            chartCanvas,
+            samples: samples.map(s => ({
+                time: s.time,
+                motion: s.batterMotion,
+                brightness: s.brightness,
+            })),
+            gameplayStartIdx,
+            gameplayStartTime,
+            titleCardSkipped: gameplayStartIdx > 0,
+            events: events.map(e => ({
+                peakTime: e.peakTime,
+                startTime: e.startTime,
+                endTime: e.endTime,
+                peakMotion: e.peakMotion,
+            })),
+            videoInfo: {
+                duration,
+                width: videoEl.videoWidth,
+                height: videoEl.videoHeight,
+                sampleCount: samples.length,
+                sampleInterval,
+            },
+        };
+    }
+
     // ---- Public API ----
     return {
         analyze,
+        diagnose,
         parseFilename,
         PHASES,
         OUTCOMES,
